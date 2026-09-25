@@ -6,18 +6,37 @@ import os
 import time
 import auraloss
 import soundfile as sf
+import matplotlib.pyplot as plt
 
 from collections import OrderedDict
 
-from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving
+from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving, parallelGFDNPEQ
 from flamo.optimize.dataset import Dataset, load_dataset
-from flamo.optimize.loss import sparsity_loss
+from flamo.optimize.loss import sparsity_loss, edr_loss, edc_loss
 from flamo.optimize.trainer import Trainer
 from flamo.processor import dsp, system
 from flamo.utils import save_audio
 from flamo.functional import signal_gallery, find_onset
 
 torch.manual_seed(130798)
+
+
+def plot_loss_history(trainer: Trainer, output_dir: str) -> None:
+    """Save total training and validation loss against epoch number."""
+    epochs = range(1, len(trainer.train_loss) + 1)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epochs, trainer.train_loss, marker="o", label="Training loss")
+    ax.plot(epochs, trainer.valid_loss, marker="o", label="Validation loss")
+    ax.set(
+        xlabel="Epoch",
+        ylabel="Total loss",
+        title="GFDN training loss",
+    )
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "loss_history.png"), dpi=150)
+    plt.close(fig)
 
 
 class MultiResoSTFT(nn.Module):
@@ -63,16 +82,18 @@ class GroupedFDN(system.Shell):
         rt_dc: Optional[float] = 1.0,
         rt_nyquist: Optional[float] = 0.2,
         crossover_freq: Optional[float] = 4000.0,
+        is_twostage: bool = False,
         alias_decay_db: Optional[float] = 0.0,
         device: Optional[str] = 'cuda',
         dtype: Optional[torch.dtype] = torch.float32,
     ) -> None:
         assert group_size >= 2 and group_size & (group_size - 1) == 0, (
-            f"group_size must be a power of two >= 2, got {group_size}"
-        )
+            f"group_size must be a power of two >= 2, got {group_size}")
 
         n_delays = group_size * n_groups
-        delay_lengths = torch.as_tensor(delay_lengths, device=device, dtype=torch.int64)
+        delay_lengths = torch.as_tensor(delay_lengths,
+                                        device=device,
+                                        dtype=torch.int64)
         assert delay_lengths.numel() == n_delays, (
             f"delay_lengths must have {n_delays} entries (group_size * n_groups), got {delay_lengths.numel()}"
         )
@@ -95,7 +116,7 @@ class GroupedFDN(system.Shell):
         )
 
         delays = dsp.parallelDelay(
-            size=(n_delays,),
+            size=(n_delays, ),
             max_len=delay_lengths.max(),
             nfft=nfft,
             isint=True,
@@ -117,42 +138,62 @@ class GroupedFDN(system.Shell):
             dtype=dtype,
         )
 
-        attenuation = parallelGFDNFirstOrderShelving(
+        # replace first order shelving with PEQs
+
+        # attenuation = parallelGFDNFirstOrderShelving(
+        #     nfft=nfft,
+        #     fs=fs,
+        #     rt_nyquist=rt_nyquist,
+        #     n_groups=n_groups,
+        #     delays=delay_lengths,
+        #     alias_decay_db=alias_decay_db,
+        #     requires_grad=True,
+        #     device=device,
+        #     dtype=dtype,
+        # )
+        # omega_c = 2 * torch.pi * crossover_freq / fs
+        # attenuation.assign_value(
+        #     torch.tensor([rt_dc, omega_c], device=device, dtype=dtype))
+
+        attenuation = parallelGFDNPEQ(
+            n_bands=8,
+            f_min=20,
+            f_max=2000,
             nfft=nfft,
             fs=fs,
-            rt_nyquist=rt_nyquist,
-            n_groups=n_groups,
             delays=delay_lengths,
+            design='biquad',
+            is_twostage=is_twostage,
+            is_proportional=False,
+            n_groups=n_groups,
             alias_decay_db=alias_decay_db,
             requires_grad=True,
             device=device,
             dtype=dtype,
         )
-        omega_c = 2 * torch.pi * crossover_freq / fs
-        attenuation.assign_value(
-            torch.tensor([rt_dc, omega_c], device=device, dtype=dtype)
-        )
 
         feedback = system.Series(
-            OrderedDict({"mixing_matrix": mixing_matrix, "attenuation": attenuation})
-        )
+            OrderedDict({
+                "mixing_matrix": mixing_matrix,
+                "attenuation": attenuation
+            }))
         feedback_loop = system.Recursion(fF=delays, fB=feedback)
 
         core = system.Series(
-            OrderedDict(
-                {
-                    "input_gain": input_gain,
-                    "feedback_loop": feedback_loop,
-                    "output_gain": output_gain,
-                }
-            )
-        )
+            OrderedDict({
+                "input_gain": input_gain,
+                "feedback_loop": feedback_loop,
+                "output_gain": output_gain,
+            }))
 
         input_layer = dsp.FFT(nfft, dtype=dtype)
-        output_layer = dsp.iFFTAntiAlias(
-            nfft=nfft, alias_decay_db=alias_decay_db, device=device, dtype=dtype
-        )
-        super().__init__(core=core, input_layer=input_layer, output_layer=output_layer)
+        output_layer = dsp.iFFTAntiAlias(nfft=nfft,
+                                         alias_decay_db=alias_decay_db,
+                                         device=device,
+                                         dtype=dtype)
+        super().__init__(core=core,
+                         input_layer=input_layer,
+                         output_layer=output_layer)
 
 
 def example_gfdn(args):
@@ -167,13 +208,14 @@ def example_gfdn(args):
         None
     """
 
-    # read target 
+    # read target
     target_rir = torch.tensor(sf.read(args.target_rir)[0], dtype=torch.float32)
     target_rir = target_rir / torch.max(torch.abs(target_rir))
     rir_onset = find_onset(target_rir)
-    target_rir = target_rir[rir_onset : (rir_onset + args.nfft)].view(1, -1, 1)
-    # zero pad to nfft 
-    target_rir = torch.nn.functional.pad(target_rir, (0, 0, 0, args.nfft - target_rir.shape[1]))
+    target_rir = target_rir[rir_onset:(rir_onset + args.nfft)].view(1, -1, 1)
+    # zero pad to nfft
+    target_rir = torch.nn.functional.pad(
+        target_rir, (0, 0, 0, args.nfft - target_rir.shape[1]))
 
     # GFDN parameters
     delays = [997, 1153, 1327, 1559]
@@ -195,13 +237,15 @@ def example_gfdn(args):
         rt_nyquist=0.2,
         crossover_freq=4000.0,
         alias_decay_db=alias_decay_db,
+        is_twostage=args.is_twostage,
         device=args.device,
         dtype=args.dtype,
     )
 
     # Get initial impulse response
     with torch.no_grad():
-        ir_init = model.get_time_response(identity=False, fs=args.samplerate).squeeze()
+        ir_init = model.get_time_response(identity=False,
+                                          fs=args.samplerate).squeeze()
         save_audio(
             os.path.join(args.train_dir, "ir_init.wav"),
             ir_init / torch.max(torch.abs(ir_init)),
@@ -228,7 +272,8 @@ def example_gfdn(args):
         device=args.device,
         dtype=args.dtype,
     )
-    train_loader, valid_loader = load_dataset(dataset, batch_size=args.batch_size)
+    train_loader, valid_loader = load_dataset(dataset,
+                                              batch_size=args.batch_size)
 
     # Initialize training process
     trainer = Trainer(
@@ -241,15 +286,19 @@ def example_gfdn(args):
     )
     trainer.register_criterion(MultiResoSTFT(), 1)
     trainer.register_criterion(sparsity_loss(), 1, requires_model=True)
+    # trainer.register_criterion(edr_loss(sample_rate=args.samplerate), 1)
+    # trainer.register_criterion(edc_loss(sample_rate=args.samplerate), 1e-6)
 
     ## ---------------- TRAIN ---------------- ##
 
     # Train the model
     trainer.train(train_loader, valid_loader)
+    plot_loss_history(trainer, args.train_dir)
 
     # Get optimized impulse response
     with torch.no_grad():
-        ir_optim = model.get_time_response(identity=False, fs=args.samplerate).squeeze()
+        ir_optim = model.get_time_response(identity=False,
+                                           fs=args.samplerate).squeeze()
         save_audio(
             os.path.join(args.train_dir, "ir_optim.wav"),
             ir_optim / torch.max(torch.abs(ir_optim)),
@@ -262,25 +311,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--nfft", type=int, default=96000, help="FFT size")
-    parser.add_argument("--samplerate", type=int, default=48000, help="sampling rate")
-    parser.add_argument("--dtype", type=str, default="float64", choices=["float32", "float64"], help="data type for tensors")
+    parser.add_argument("--samplerate",
+                        type=int,
+                        default=48000,
+                        help="sampling rate")
+    parser.add_argument("--dtype",
+                        type=str,
+                        default="float64",
+                        choices=["float32", "float64"],
+                        help="data type for tensors")
     parser.add_argument("--num", type=int, default=100, help="dataset size")
-    parser.add_argument(
-        "--device", type=str, default="cuda", help="device to use for computation"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=1, help="batch size for training"
-    )
-    parser.add_argument(
-        "--max_epochs", type=int, default=20, help="maximum number of epochs"
-    )
+    parser.add_argument("--device",
+                        type=str,
+                        default="cuda",
+                        help="device to use for computation")
+    parser.add_argument("--batch_size",
+                        type=int,
+                        default=1,
+                        help="batch size for training")
+    parser.add_argument("--max_epochs",
+                        type=int,
+                        default=20,
+                        help="maximum number of epochs")
     parser.add_argument("--lr", type=float, default=1e-2, help="learning rate")
-    parser.add_argument(
-        "--train_dir", type=str, help="directory to save training results"
-    )
-    parser.add_argument(
-        "--masked_loss", type=bool, default=False, help="use masked loss"
-    )
+    parser.add_argument("--train_dir",
+                        type=str,
+                        help="directory to save training results")
+    parser.add_argument("--masked_loss",
+                        type=bool,
+                        default=False,
+                        help="use masked loss")
+    parser.add_argument("--is_twostage",
+                        type=bool,
+                        action="store_true",
+                        help="use two stage attenuation filter")
     parser.add_argument(
         "--target_rir",
         type=str,
@@ -307,14 +371,10 @@ if __name__ == "__main__":
 
     # Save arguments
     with open(os.path.join(args.train_dir, "args.txt"), "w") as f:
-        f.write(
-            "\n".join(
-                [
-                    str(k) + "," + str(v)
-                    for k, v in sorted(vars(args).items(), key=lambda x: x[0])
-                ]
-            )
-        )
+        f.write("\n".join([
+            str(k) + "," + str(v)
+            for k, v in sorted(vars(args).items(), key=lambda x: x[0])
+        ]))
 
     # Run the example GFDN training
     example_gfdn(args)

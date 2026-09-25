@@ -14,6 +14,8 @@ from flamo.functional import (
 )
 from flamo.processor.dsp import Filter
 from flamo.auxiliary.eq import eq_freqs
+
+
 def rt2slope(rt60: torch.Tensor, fs: int):
     r"""
     Convert time in seconds of 60 dB decay to energy decay slope.
@@ -27,6 +29,7 @@ def rt2absorption(rt60: torch.Tensor, fs: int, delays_len: torch.Tensor):
     """
     slope = rt2slope(rt60, fs)
     return torch.einsum("i,j->ij", slope, delays_len)
+
 
 class map_gamma(torch.nn.Module):
 
@@ -46,15 +49,15 @@ class map_gamma(torch.nn.Module):
         # per-batch scalar.
         g0 = x[:, 0].unsqueeze(-1)
         if self.is_compressed:
-            return (
-                torch.sigmoid(g0) * (self.g_max - self.g_min) + self.g_min
-            ) ** self.delays
+            return (torch.sigmoid(g0) * (self.g_max - self.g_min) +
+                    self.g_min)**self.delays
         else:
-            return g0 ** self.delays
+            return g0**self.delays
+
 
 class inverse_map_gamma(torch.nn.Module):
 
-    def __init__(self, delays = None,  is_compressed=True):
+    def __init__(self, delays=None, is_compressed=True):
         super().__init__()
         self.delays = delays
         self.is_compressed = is_compressed
@@ -67,15 +70,18 @@ class inverse_map_gamma(torch.nn.Module):
             if self.delays is None:
                 sig = (y - self.g_min) / (self.g_max - self.g_min)
             else:
-                sig = (y**(1/self.delays) - self.g_min) / (self.g_max - self.g_min)
-            return torch.log(sig/(1-sig)) 
+                sig = (y**(1 / self.delays) - self.g_min) / (self.g_max -
+                                                             self.g_min)
+            return torch.log(sig / (1 - sig))
         else:
             if self.delays is None:
                 return y
             else:
-                return y**(1/self.delays)
+                return y**(1 / self.delays)
+
 
 class map_gfdn_gamma(torch.nn.Module):
+
     def __init__(self, delays: torch.Tensor, n_groups: int, fs: int):
         super().__init__()
         self.delays = delays
@@ -84,8 +90,10 @@ class map_gfdn_gamma(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Map input to grouped RT values."""
-        gamma = torch.mul(rt2slope(x, self.fs).unsqueeze(-1), self.delays.unsqueeze(0))
+        gamma = torch.mul(
+            rt2slope(x, self.fs).unsqueeze(-1), self.delays.unsqueeze(0))
         return gamma
+
 
 class HomogeneousFDN:
     r"""
@@ -111,7 +119,8 @@ class HomogeneousFDN:
     def set_model(self, input_layer=None, output_layer=None):
         # set the input and output layers of the FDN model
         if input_layer is None:
-            input_layer = dsp.FFT(self.config_dict.nfft, dtype=self.config_dict.dtype)
+            input_layer = dsp.FFT(self.config_dict.nfft,
+                                  dtype=self.config_dict.dtype)
         if output_layer is None:
             output_layer = dsp.iFFTAntiAlias(
                 nfft=self.config_dict.nfft,
@@ -147,7 +156,7 @@ class HomogeneousFDN:
         # RECURSION
         # Feedback loop with delays
         delays = dsp.parallelDelay(
-            size=(self.N,),
+            size=(self.N, ),
             max_len=delay_lines.max(),
             nfft=self.config_dict.nfft,
             isint=self.config_dict.is_delay_int,
@@ -172,7 +181,7 @@ class HomogeneousFDN:
 
         # homogeneous attenuation
         attenuation = dsp.parallelGain(
-            size=(self.N,),
+            size=(self.N, ),
             nfft=self.config_dict.nfft,
             requires_grad=self.config_dict.attenuation_grad,
             alias_decay_db=self.config_dict.alias_decay_db,
@@ -180,42 +189,36 @@ class HomogeneousFDN:
             dtype=self.config_dict.dtype,
         )
         attenuation.map = map_gamma(delay_lines)
-        attenuation.assign_value(
-            6
-            * torch.ones(
-                (self.N,),
-            )
-        )
+        attenuation.assign_value(6 * torch.ones((self.N, ), ))
 
         feedforward = system.Series(
-            OrderedDict({"delays": delays, "attenuation": attenuation})
-        )
+            OrderedDict({
+                "delays": delays,
+                "attenuation": attenuation
+            }))
         # Build recursion
         feedback_loop = system.Recursion(fF=feedforward, fB=mixing_matrix)
 
         # Build the FDN
         FDN = system.Series(
-            OrderedDict(
-                {
-                    "input_gain": input_gain,
-                    "feedback_loop": feedback_loop,
-                    "output_gain": output_gain,
-                }
-            )
-        )
+            OrderedDict({
+                "input_gain": input_gain,
+                "feedback_loop": feedback_loop,
+                "output_gain": output_gain,
+            }))
         return FDN
 
     def get_shell(self, input_layer, output_layer):
-        return system.Shell(
-            core=self.fdn, input_layer=input_layer, output_layer=output_layer
-        )
+        return system.Shell(core=self.fdn,
+                            input_layer=input_layer,
+                            output_layer=output_layer)
 
     def get_delay_lines(self):
         """Co-prime delay line lenghts for a given range"""
         ms_to_samps = lambda ms, fs: np.round(ms * fs / 1000).astype(int)
         delay_range_samps = ms_to_samps(
-            np.asarray(self.config_dict.delay_range_ms), self.config_dict.sample_rate
-        )
+            np.asarray(self.config_dict.delay_range_ms),
+            self.config_dict.sample_rate)
         # generate prime numbers in specified range
         prime_nums = np.array(
             list(sp.primerange(delay_range_samps[0], delay_range_samps[1])),
@@ -224,7 +227,8 @@ class HomogeneousFDN:
         rand_primes = prime_nums[np.random.permutation(len(prime_nums))]
         # delay line lengths
         delay_lengths = np.array(
-            np.r_[rand_primes[: self.N - 1], sp.nextprime(delay_range_samps[1])],
+            np.r_[rand_primes[:self.N - 1],
+                  sp.nextprime(delay_range_samps[1])],
             dtype=np.int32,
         ).tolist()
         return delay_lengths
@@ -236,11 +240,11 @@ class HomogeneousFDN:
             param = {}
             param["A"] = core.feedback_loop.feedback.param.cpu().numpy()
             param["attenuation"] = (
-                core.feedback_loop.feedforward.attenuation.param.cpu().numpy()
-            )
+                core.feedback_loop.feedforward.attenuation.param.cpu().numpy())
             param["B"] = core.input_gain.param.cpu().numpy()
             param["C"] = core.output_gain.param.cpu().numpy()
-            param["m"] = core.feedback_loop.feedforward.delays.param.cpu().numpy()
+            param["m"] = core.feedback_loop.feedforward.delays.param.cpu(
+            ).numpy()
             return param
 
     def set_raw_parameters(self, param: dict):
@@ -253,16 +257,14 @@ class HomogeneousFDN:
                     core.feedback_loop.feedback.assign_value(tensor_value)
                 elif key == "attenuation":
                     core.feedback_loop.feedforward.attenuation.assign_value(
-                        tensor_value.squeeze()
-                    )
+                        tensor_value.squeeze())
                 elif key == "B":
                     core.input_gain.assign_value(tensor_value)
                 elif key == "C":
                     core.output_gain.assign_value(tensor_value)
                 elif key == "m":
                     core.feedback_loop.feedforward.delays.assign_value(
-                        tensor_value.squeeze()
-                    )
+                        tensor_value.squeeze())
             self.model.set_core(core)
 
     def normalize_energy(
@@ -281,30 +283,24 @@ class HomogeneousFDN:
         with torch.no_grad():
             core = self.model.get_core()
             core.input_gain.assign_value(
-                torch.div(
-                    core.input_gain.param, torch.pow(energy_H / target_energy, 1 / 4)
-                )
-            )
+                torch.div(core.input_gain.param,
+                          torch.pow(energy_H / target_energy, 1 / 4)))
             core.output_gain.assign_value(
-                torch.div(
-                    core.output_gain.param, torch.pow(energy_H / target_energy, 1 / 4)
-                )
-            )
+                torch.div(core.output_gain.param,
+                          torch.pow(energy_H / target_energy, 1 / 4)))
             self.model.set_core(core)
 
         # recompute the energy of the FDN
         H = self.model.get_freq_response(identity=False)
         energy_H = torch.mean(torch.pow(torch.abs(H), 2))
-        assert (
-            abs(energy_H - target_energy) / target_energy < 0.0001
-        ), "Energy normalization failed"
+        assert (abs(energy_H - target_energy) / target_energy
+                < 0.0001), "Energy normalization failed"
 
     def rt2gain(self, rt60):
         # convert RT60 to gain
-        gdB = rt2absorption(
-            rt60, self.config_dict.sample_rate, torch.tensor(self.delays)
-        ).squeeze()
-        return 10 ** (gdB / 20)
+        gdB = rt2absorption(rt60, self.config_dict.sample_rate,
+                            torch.tensor(self.delays)).squeeze()
+        return 10**(gdB / 20)
 
 
 class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
@@ -312,14 +308,14 @@ class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
     Class for creating a set of parallel attenuation filters that are scaled 
     according to the given delay lengths. This is meant to be used inside the 
     feedback path of an FDN.
-    
+
     The parameters represent the reverberation time in seconds. 
     The command gains are computed from the reverberation time as follows:
 
     .. math::
         \gamma = 10^{(60 \cdot \text{rt60} / 20)}
         \gamma_i = \gamma^{d_i}
-    
+
     where :math:`\gamma` is the command gain, :math:`\text{rt60}` is the reverberation time,
     and :math:`d_i` is the delay length of the :math:`i`-th delay line.
 
@@ -332,34 +328,31 @@ class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
             - **device** (optional): Device to perform computations on. Default is None.
 
     """
-    def __init__(
-        self,
-        octave_interval: int = 1,
-        nfft: int = 2**11,
-        fs: int = 48000,
-        delays: torch.Tensor =  None,
-        alias_decay_db: float = 0.0,
-        start_freq: float = 31.25,
-        end_freq: float = 16000.0,
-        device=None, 
-        dtype=torch.float32
-    ):
+
+    def __init__(self,
+                 octave_interval: int = 1,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 delays: torch.Tensor = None,
+                 alias_decay_db: float = 0.0,
+                 start_freq: float = 31.25,
+                 end_freq: float = 16000.0,
+                 device=None,
+                 dtype=torch.float32):
         assert (delays is not None), "Delays must be provided"
         self.delays = delays
-        map = lambda x: torch.mul(rt2slope(x, fs).unsqueeze(-1), delays.unsqueeze(0))
-        super().__init__(
-            size=( ),
-            octave_interval=octave_interval,
-            nfft=nfft,
-            fs=fs,
-            map=map,
-            alias_decay_db=alias_decay_db,
-            start_freq=start_freq,
-            end_freq=end_freq,
-            device=device, 
-            dtype=dtype
-        )
-
+        map = lambda x: torch.mul(
+            rt2slope(x, fs).unsqueeze(-1), delays.unsqueeze(0))
+        super().__init__(size=(),
+                         octave_interval=octave_interval,
+                         nfft=nfft,
+                         fs=fs,
+                         map=map,
+                         alias_decay_db=alias_decay_db,
+                         start_freq=start_freq,
+                         end_freq=end_freq,
+                         device=device,
+                         dtype=dtype)
 
     def get_poly_coeff(self, param):
         r"""
@@ -373,23 +366,28 @@ class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
         """
         param = param.squeeze(0)
         n_gains = self.size[-1]
-        a = torch.zeros((3, n_gains+1, len(self.delays)), device=self.device)
-        b = torch.zeros((3, n_gains+1, len(self.delays)), device=self.device)
+        a = torch.zeros((3, n_gains + 1, len(self.delays)), device=self.device)
+        b = torch.zeros((3, n_gains + 1, len(self.delays)), device=self.device)
         for n_i in range(len(self.delays)):
-                b[:, :, n_i], a[:, :, n_i] = accurate_geq(
-                    target_gain=param[:, n_i],
-                    center_freq=self.center_freq,
-                    shelving_crossover=self.shelving_crossover,
-                    fs=self.fs,
-                    device=self.device
-                )
+            b[:, :, n_i], a[:, :, n_i] = accurate_geq(
+                target_gain=param[:, n_i],
+                center_freq=self.center_freq,
+                shelving_crossover=self.shelving_crossover,
+                fs=self.fs,
+                device=self.device)
 
-        b_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy.to(torch.double), b.to(torch.double))
-        a_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy.to(torch.double), a.to(torch.double))
+        b_aa = torch.einsum('p, pon -> pon',
+                            self.alias_envelope_dcy.to(torch.double),
+                            b.to(torch.double))
+        a_aa = torch.einsum('p, pon -> pon',
+                            self.alias_envelope_dcy.to(torch.double),
+                            a.to(torch.double))
         B = torch.fft.rfft(b_aa, self.nfft, dim=0)
         A = torch.fft.rfft(a_aa, self.nfft, dim=0)
         H_temp = torch.prod(B, dim=1) / (torch.prod(A, dim=1))
-        H = torch.where(torch.abs(torch.prod(A, dim=1)) != 0, H_temp, torch.finfo(H_temp.dtype).eps*torch.ones_like(H_temp))
+        H = torch.where(
+            torch.abs(torch.prod(A, dim=1)) != 0, H_temp,
+            torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
         H_type = torch.complex128 if param.dtype == torch.float64 else torch.complex64
         return H.to(H_type).unsqueeze(0), B, A
 
@@ -405,76 +403,83 @@ class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
         self.input_channels = len(self.delays)
         self.output_channels = len(self.delays)
 
+
 class parallelGFDNAccurateGEQ(parallelFDNAccurateGEQ):
     # TODO
-    def __init__(
-        self,
-        octave_interval: int = 1,
-        n_groups: int = 2,
-        nfft: int = 2**11,
-        fs: int = 48000,
-        delays: torch.Tensor =  None,
-        alias_decay_db: float = 0.0,
-        start_freq: float = 31.25,
-        end_freq: float = 16000.0,
-        device=None,
-        dtype=torch.float32
-    ):
+    def __init__(self,
+                 octave_interval: int = 1,
+                 n_groups: int = 2,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 delays: torch.Tensor = None,
+                 alias_decay_db: float = 0.0,
+                 start_freq: float = 31.25,
+                 end_freq: float = 16000.0,
+                 device=None,
+                 dtype=torch.float32):
         assert (delays is not None), "Delays must be provided"
         self.delays = delays
         self.n_groups = n_groups
-        super().__init__(
-            octave_interval=octave_interval,
-            nfft=nfft,
-            delays=delays,
-            fs=fs,
-            alias_decay_db=alias_decay_db,
-            start_freq=start_freq,
-            end_freq=end_freq,
-            device=device,
-            dtype=dtype
-        )
+        super().__init__(octave_interval=octave_interval,
+                         nfft=nfft,
+                         delays=delays,
+                         fs=fs,
+                         alias_decay_db=alias_decay_db,
+                         start_freq=start_freq,
+                         end_freq=end_freq,
+                         device=device,
+                         dtype=dtype)
         # self.size at this point is (batch, n_gains) (batch is always the singleton
         # default here -- this class does not expose batch_size); n_gains is the
         # last dim, not the first.
         self.n_gains = self.size[-1]
-        self.size = (self.n_groups * self.n_gains,)
-        self.param = torch.nn.Parameter(
-            torch.empty(self.size, device=self.device), requires_grad=self.requires_grad
-        )
+        self.size = (self.n_groups * self.n_gains, )
+        self.param = torch.nn.Parameter(torch.empty(self.size,
+                                                    device=self.device),
+                                        requires_grad=self.requires_grad)
         self.map = map_gfdn_gamma(self.delays, self.n_groups, self.fs)
 
     def get_poly_coeff(self, param):
         r"""
         Computes the polynomial coefficients for the SOS section.
         """
-        a = torch.zeros((3, self.size[0]+self.n_groups, len(self.delays)), device=self.device)
-        b = torch.zeros((3, self.size[0]+self.n_groups, len(self.delays)), device=self.device)
+        a = torch.zeros((3, self.size[0] + self.n_groups, len(self.delays)),
+                        device=self.device)
+        b = torch.zeros((3, self.size[0] + self.n_groups, len(self.delays)),
+                        device=self.device)
         for n_i in range(len(self.delays)):
             for i_group in range(self.n_groups):
                 (
-                    b[:, i_group * (self.n_gains+1) : (i_group + 1) * (self.n_gains+1), n_i],
-                    a[:, i_group * (self.n_gains+1) : (i_group + 1) * (self.n_gains+1), n_i],
+                    b[:, i_group * (self.n_gains + 1):(i_group + 1) *
+                      (self.n_gains + 1), n_i],
+                    a[:, i_group * (self.n_gains + 1):(i_group + 1) *
+                      (self.n_gains + 1), n_i],
                 ) = accurate_geq(
-                    target_gain=param[
-                        i_group * self.n_gains : (i_group + 1) * self.n_gains, n_i
-                    ],
+                    target_gain=param[i_group * self.n_gains:(i_group + 1) *
+                                      self.n_gains, n_i],
                     center_freq=self.center_freq,
                     shelving_crossover=self.shelving_crossover,
                     fs=self.fs,
                     device=self.device,
                 )
 
-        b_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy.to(torch.double), b.to(torch.double))
-        a_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy.to(torch.double), a.to(torch.double))
+        b_aa = torch.einsum('p, pon -> pon',
+                            self.alias_envelope_dcy.to(torch.double),
+                            b.to(torch.double))
+        a_aa = torch.einsum('p, pon -> pon',
+                            self.alias_envelope_dcy.to(torch.double),
+                            a.to(torch.double))
         B = torch.fft.rfft(b_aa, self.nfft, dim=0)
         A = torch.fft.rfft(a_aa, self.nfft, dim=0)
         H_temp = torch.prod(B, dim=1) / (torch.prod(A, dim=1))
-        H = torch.where(torch.abs(torch.prod(A, dim=1)) != 0, H_temp, torch.finfo(H_temp.dtype).eps*torch.ones_like(H_temp))
+        H = torch.where(
+            torch.abs(torch.prod(A, dim=1)) != 0, H_temp,
+            torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
         H_type = torch.complex128 if param.dtype == torch.float64 else torch.complex64
         # self.param has no batch dimension (rebuilt without one in __init__), so H
         # needs one added back for the inherited (batch-first) freq_convolve.
         return H.to(H_type).unsqueeze(0), B, A
+
 
 class parallelFDNGEQ(dsp.parallelGEQ):
     r"""
@@ -483,14 +488,14 @@ class parallelFDNGEQ(dsp.parallelGEQ):
     feedback path of an FDN. This class differs from `parallelFDNAccurateGEQ` in 
     that it uses a nonoptimized version of the GEQ filter design. But this makes 
     it trainable. 
-    
+
     The parameters represent the reverberation time in seconds. 
     The command gains are computed from the reverberation time as follows:
 
     .. math::
         \gamma = 10^{(60 \cdot \text{rt60} / 20)}
         \gamma_i = \gamma^{d_i}
-    
+
     where :math:`\gamma` is the command gain, :math:`\text{rt60}` is the reverberation time,
     and :math:`d_i` is the delay length of the :math:`i`-th delay line.
 
@@ -503,17 +508,16 @@ class parallelFDNGEQ(dsp.parallelGEQ):
             - **device** (optional): Device to perform computations on. Default is None.
 
     """
-    def __init__(
-        self,
-        octave_interval: int = 1,
-        nfft: int = 2**11,
-        fs: int = 48000,
-        delays: torch.Tensor =  None,
-        requires_grad: bool = False,
-        alias_decay_db: float = 0.0,
-        device: Optional[str] = None,
-        dtype=torch.float32
-    ):
+
+    def __init__(self,
+                 octave_interval: int = 1,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 delays: torch.Tensor = None,
+                 requires_grad: bool = False,
+                 alias_decay_db: float = 0.0,
+                 device: Optional[str] = None,
+                 dtype=torch.float32):
         assert (delays is not None), "Delays must be provided"
         self.delays = delays
         # convert from second to decay in dB
@@ -521,16 +525,15 @@ class parallelFDNGEQ(dsp.parallelGEQ):
         # map = lambda x: torch.mul(rt2slope(x, fs).unsqueeze(-1), delays.unsqueeze(0))
         map = lambda x: x
         super().__init__(
-            size=( ),   # the size is (n_bands, n_delays)
+            size=(),  # the size is (n_bands, n_delays)
             octave_interval=octave_interval,
             nfft=nfft,
             fs=fs,
             map=map,
             requires_grad=requires_grad,
             alias_decay_db=alias_decay_db,
-            device=device, 
-            dtype=dtype
-        )
+            device=device,
+            dtype=dtype)
 
     def get_poly_coeff(self, param):
         r"""
@@ -548,26 +551,27 @@ class parallelFDNGEQ(dsp.parallelGEQ):
         b = torch.zeros((3, n_bands, len(self.delays)), device=self.device)
         R = torch.tensor(2.7, device=self.device)
         for n_i in range(len(self.delays)):
-                b[:, :, n_i], a[:, :, n_i] = geq(
-                    gain_db=torch.mul(rt2slope(param, self.fs).unsqueeze(-1), self.delays[n_i]),
-                    center_freq=self.center_freq,
-                    R=R,
-                    shelving_freq=self.shelving_crossover,
-                    fs=self.fs,
-                    device=self.device
-                )
+            b[:, :,
+              n_i], a[:, :, n_i] = geq(gain_db=torch.mul(
+                  rt2slope(param, self.fs).unsqueeze(-1), self.delays[n_i]),
+                                       center_freq=self.center_freq,
+                                       R=R,
+                                       shelving_freq=self.shelving_crossover,
+                                       fs=self.fs,
+                                       device=self.device)
         b_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy, b)
         a_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy, a)
         B = torch.fft.rfft(b_aa, self.nfft, dim=0)
         A = torch.fft.rfft(a_aa, self.nfft, dim=0)
         H_temp = torch.prod(B, dim=1) / (torch.prod(A, dim=1))
-        H = torch.where(torch.abs(torch.prod(A, dim=1)) != 0, H_temp, torch.finfo(H_temp.dtype).eps*torch.ones_like(H_temp))
+        H = torch.where(
+            torch.abs(torch.prod(A, dim=1)) != 0, H_temp,
+            torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
         return H.unsqueeze(0), B, A
 
     def check_param_shape(self):
-        assert (
-            len(self.size) == 2
-        ), 'The parameter should contain only the command gains'
+        assert (len(self.size) == 2
+                ), 'The parameter should contain only the command gains'
 
     def get_io(self):
         r"""
@@ -577,30 +581,30 @@ class parallelFDNGEQ(dsp.parallelGEQ):
         self.output_channels = len(self.delays)
 
     def init_param(self):
-        return torch.nn.init.uniform_(self.param, a=1.0, b=3.0) 
+        return torch.nn.init.uniform_(self.param, a=1.0, b=3.0)
+
 
 class parallelFDNPEQ(Filter):
     r"""
     Parallel counterpart of the :class:`PEQ` class
     For information about **attributes** and **methods** see :class:`flamo.processor.dsp.PEQ`.
     """
-    def __init__(
-        self,
-        n_bands: int = 10,
-        f_min: float = 20,
-        f_max: float = 20000,
-        delays: torch.Tensor =  None,
-        design: str = "biquad",
-        is_twostage: bool = False,
-        is_proportional: bool = False,
-        nfft: int = 2**11,
-        fs: int = 48000,
-        map: callable = lambda x: x,
-        requires_grad: bool = False,
-        alias_decay_db: float = 0.0,
-        device: Optional[str] = None,
-        dtype=torch.float32
-    ):
+
+    def __init__(self,
+                 n_bands: int = 10,
+                 f_min: float = 20,
+                 f_max: float = 20000,
+                 delays: torch.Tensor = None,
+                 design: str = "biquad",
+                 is_twostage: bool = False,
+                 is_proportional: bool = False,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 map: callable = lambda x: x,
+                 requires_grad: bool = False,
+                 alias_decay_db: float = 0.0,
+                 device: Optional[str] = None,
+                 dtype=torch.float32):
         self.delays = delays
         self.is_twostage = is_twostage
         self.is_proportional = is_proportional
@@ -609,21 +613,21 @@ class parallelFDNPEQ(Filter):
         self.fs = fs
         self.f_min = f_min
         self.f_max = f_max
-        gamma = 10 ** (
-            -torch.abs(torch.tensor(alias_decay_db, device=device)) / (nfft) / 20
-        )
+        gamma = 10**(-torch.abs(torch.tensor(alias_decay_db, device=device)) /
+                     (nfft) / 20)
         k = torch.arange(1, self.n_bands + 1, dtype=torch.float32)
-        self.center_freq_bias = f_min * (f_max / f_min) ** ((k - 1) / (self.n_bands - 1))
-        self.alias_envelope_dcy = gamma ** torch.arange(0, 3, 1, device=device)
+        self.center_freq_bias = f_min * (f_max / f_min)**((k - 1) /
+                                                          (self.n_bands - 1))
+        self.alias_envelope_dcy = gamma**torch.arange(0, 3, 1, device=device)
         super().__init__(
-            size=(self.n_bands+1 if self.is_twostage else self.n_bands, 3, 1 if self.is_proportional else len(delays)),
+            size=(self.n_bands + 1 if self.is_twostage else self.n_bands, 3,
+                  1 if self.is_proportional else len(delays)),
             nfft=nfft,
             map=map,
             requires_grad=requires_grad,
             alias_decay_db=alias_decay_db,
             device=device,
-            dtype=dtype
-        )
+            dtype=dtype)
 
     def get_poly_coeff(self, param):
         r"""
@@ -643,71 +647,82 @@ class parallelFDNPEQ(Filter):
         else:
             param_eq = self.map_eq(param)
 
-        a = torch.zeros((self.n_bands + 1 if self.is_twostage else self.n_bands, 3, len(self.delays)), device=self.device)
-        b = torch.zeros((self.n_bands + 1 if self.is_twostage else self.n_bands, 3, len(self.delays)), device=self.device)
-            
+        a = torch.zeros(
+            (self.n_bands + 1 if self.is_twostage else self.n_bands, 3,
+             len(self.delays)),
+            device=self.device)
+        b = torch.zeros(
+            (self.n_bands + 1 if self.is_twostage else self.n_bands, 3,
+             len(self.delays)),
+            device=self.device)
+
         for n_i in range(len(self.delays)):
             if self.is_proportional:
                 f = param_eq[0, :, 0]
                 R = param_eq[1, :, 0]
                 G = param_eq[2, :, 0] * self.delays[n_i]
             else:
-                f = param_eq[0, :, n_i] 
+                f = param_eq[0, :, n_i]
                 R = param_eq[1, :, n_i]
                 G = param_eq[2, :, n_i]
             if self.is_twostage:
                 if self.is_proportional:
-                    f = torch.cat((f, param_ls[0, 0].unsqueeze(0)), dim=0) 
+                    f = torch.cat((f, param_ls[0, 0].unsqueeze(0)), dim=0)
                     R = torch.cat((R, param_ls[1, 0].unsqueeze(0)), dim=0)
-                    G = torch.cat((G, param_ls[2, 0].unsqueeze(0) * self.delays[n_i]), dim=0) 
+                    G = torch.cat(
+                        (G, param_ls[2, 0].unsqueeze(0) * self.delays[n_i]),
+                        dim=0)
                 else:
-                    f = torch.cat((f, param_ls[0, n_i].unsqueeze(0)), dim=0) 
+                    f = torch.cat((f, param_ls[0, n_i].unsqueeze(0)), dim=0)
                     R = torch.cat((R, param_ls[1, n_i].unsqueeze(0)), dim=0)
-                    G = torch.cat((G, param_ls[2, n_i].unsqueeze(0)), dim=0)                    
-            # low shelf filter 
+                    G = torch.cat((G, param_ls[2, n_i].unsqueeze(0)), dim=0)
             a[0, :, n_i], b[0, :, n_i] = self.compute_biquad_coeff(
                 f=f[0],
-                R=R[0] if self.design == 'biquad' else R[0] + torch.sqrt(torch.tensor( 1 / 2)),
+                R=R[0] if self.design == 'biquad' else R[0] +
+                torch.sqrt(torch.tensor(1 / 2)),
                 G=G[0],
-                type='highshelf'
-            )
-            # high shelf filter 
-            a[self.n_bands-1, :, n_i], b[self.n_bands-1, :, n_i] = self.compute_biquad_coeff(
-                f=f[self.n_bands-1],
-                R=R[self.n_bands-1] if self.design == 'biquad' else R[self.n_bands-1] + torch.sqrt(torch.tensor( 1 / 2)),
-                G=G[self.n_bands-1],
-                type='lowshelf'
-            )
-            # peak filter 
-            a[1:(self.n_bands-1), :, n_i], b[1:(self.n_bands-1), :, n_i] = self.compute_biquad_coeff(
-                f=f[1:(self.n_bands-1)],
-                R=R[1:(self.n_bands-1)],
-                G=G[1:(self.n_bands-1)],
-                type='peaking'
-            )
+                type='highshelf')
+            a[self.n_bands - 1, :,
+              n_i], b[self.n_bands - 1, :, n_i] = self.compute_biquad_coeff(
+                  f=f[self.n_bands - 1],
+                  R=R[self.n_bands -
+                      1] if self.design == 'biquad' else R[self.n_bands - 1] +
+                  torch.sqrt(torch.tensor(1 / 2)),
+                  G=G[self.n_bands - 1],
+                  type='lowshelf')
+            # peak filter
+            a[1:(self.n_bands - 1), :,
+              n_i], b[1:(self.n_bands - 1), :,
+                      n_i] = self.compute_biquad_coeff(
+                          f=f[1:(self.n_bands - 1)],
+                          R=R[1:(self.n_bands - 1)],
+                          G=G[1:(self.n_bands - 1)],
+                          type='peaking')
             if self.is_twostage:
-                a[-1, :, n_i], b[-1, :, n_i]= self.compute_biquad_coeff(
-                f=f[-1],
-                R=R[-1] if self.design == 'biquad' else R[-1] + torch.sqrt(torch.tensor( 1 / 2)),
-                G=G[-1],
-                type='highshelf'
-            )
+                a[-1, :, n_i], b[-1, :, n_i] = self.compute_biquad_coeff(
+                    f=f[-1],
+                    R=R[-1] if self.design == 'biquad' else R[-1] +
+                    torch.sqrt(torch.tensor(1 / 2)),
+                    G=G[-1],
+                    type='highshelf')
 
         b_aa = torch.einsum("p, opn -> opn", self.alias_envelope_dcy, b)
         a_aa = torch.einsum("p, opn -> opn", self.alias_envelope_dcy, a)
         B = torch.fft.rfft(b_aa, self.nfft, dim=1)
         A = torch.fft.rfft(a_aa, self.nfft, dim=1)
         H_temp = (torch.prod(B, dim=0) / (torch.prod(A, dim=0)))
-        H = torch.where(torch.abs(torch.prod(A, dim=0)) != 0, H_temp, torch.finfo(H_temp.dtype).eps*torch.ones_like(H_temp))
+        H = torch.where(
+            torch.abs(torch.prod(A, dim=0)) != 0, H_temp,
+            torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
         return H, B, A
 
     def compute_biquad_coeff(self, f, R, G, type='peaking'):
         # f : freq, R : resonance, G : gain in dB
-        b = torch.zeros(*f.shape, 3, device=self.device)     
-        a = torch.zeros(*f.shape, 3, device=self.device)  
+        b = torch.zeros(*f.shape, 3, device=self.device)
+        a = torch.zeros(*f.shape, 3, device=self.device)
 
         if self.design == 'svf':
-            G = 10 ** (G / 20)
+            G = 10**(G / 20)
             if type == 'peaking':
                 mLP = torch.ones_like(G)
                 mBP = 2 * R * torch.sqrt(G)
@@ -721,13 +736,13 @@ class parallelFDNPEQ(Filter):
                 mBP = 2 * R * torch.sqrt(G)
                 mHP = G
             b[..., 0] = (f**2) * mLP + f * mBP + mHP
-            b[..., 1] = 2*(f**2) * mLP - 2 * mHP
+            b[..., 1] = 2 * (f**2) * mLP - 2 * mHP
             b[..., 2] = (f**2) * mLP - f * mBP + mHP
-            a[..., 0] = f**2 + 2*R*f + 1
-            a[..., 1] = 2* (f**2) - 2
-            a[..., 2] = f**2 - 2*R*f + 1  
+            a[..., 0] = f**2 + 2 * R * f + 1
+            a[..., 1] = 2 * (f**2) - 2
+            a[..., 2] = f**2 - 2 * R * f + 1
         elif self.design == 'biquad':
-            G = 10 ** (G / 40)
+            G = 10**(G / 40)
             if type == 'peaking':
                 alpha = torch.sin(f) / (2 * R)
                 b[..., 0] = 1 + alpha * G
@@ -737,7 +752,8 @@ class parallelFDNPEQ(Filter):
                 a[..., 1] = -2 * torch.cos(f)
                 a[..., 2] = 1 - alpha / G
             elif type == 'lowshelf':
-                alpha = torch.sin(f) * torch.sqrt((G**2 + 1) * (1/R - 1) + 2*G)
+                alpha = torch.sin(f) * torch.sqrt((G**2 + 1) *
+                                                  (1 / R - 1) + 2 * G)
                 b[..., 0] = G * ((G + 1) - (G - 1) * torch.cos(f) + alpha)
                 b[..., 1] = 2 * G * ((G - 1) - (G + 1) * torch.cos(f))
                 b[..., 2] = G * ((G + 1) - (G - 1) * torch.cos(f) - alpha)
@@ -745,7 +761,8 @@ class parallelFDNPEQ(Filter):
                 a[..., 1] = -2 * ((G - 1) + (G + 1) * torch.cos(f))
                 a[..., 2] = (G + 1) + (G - 1) * torch.cos(f) - alpha
             elif type == 'highshelf':
-                alpha = torch.sin(f) * torch.sqrt((G**2 + 1) * (1/R - 1) + 2*G)
+                alpha = torch.sin(f) * torch.sqrt((G**2 + 1) *
+                                                  (1 / R - 1) + 2 * G)
                 b[..., 0] = G * ((G + 1) + (G - 1) * torch.cos(f) + alpha)
                 b[..., 1] = -2 * G * ((G - 1) + (G + 1) * torch.cos(f))
                 b[..., 2] = G * ((G + 1) + (G - 1) * torch.cos(f) - alpha)
@@ -754,45 +771,59 @@ class parallelFDNPEQ(Filter):
                 a[..., 2] = (G + 1) - (G - 1) * torch.cos(f) - alpha
 
         return a, b
-    
+
     def map_eq(self, param, is_twostage=False):
         r"""
         Mapping function for the raw parameters to the SVF filter coefficients.
         """
         if self.design == 'biquad' and not is_twostage:
             # frequency mapping
-            bias = torch.tensor(self.center_freq_bias / self.fs * 2 * torch.pi, device=self.device)
-            min_f = torch.tensor(2 * torch.pi * self.f_min / self.fs, device=self.device)
-            max_f = torch.tensor(2 * torch.pi * self.f_max / self.fs, device=self.device)
-            f = torch.clamp(torch.sigmoid(param[:, 0, ...] - 1/2) / 2**(torch.linspace(self.n_bands, 0, self.n_bands, device=self.device)).unsqueeze(-1) + bias.unsqueeze(-1), min=min_f, max=max_f) 
-            # Q factor mapping 
+            bias = torch.tensor(self.center_freq_bias / self.fs * 2 * torch.pi,
+                                device=self.device)
+            min_f = torch.tensor(2 * torch.pi * self.f_min / self.fs,
+                                 device=self.device)
+            max_f = torch.tensor(2 * torch.pi * self.f_max / self.fs,
+                                 device=self.device)
+            f = torch.clamp(
+                torch.sigmoid(param[:, 0, ...] - 1 / 2) / 2**(torch.linspace(
+                    self.n_bands, 0, self.n_bands,
+                    device=self.device)).unsqueeze(-1) + bias.unsqueeze(-1),
+                min=min_f,
+                max=max_f)
+            # Q factor mapping
             R = torch.zeros_like(param[:, 1, ...])
             R[0, :] = 0.1 + torch.sigmoid(R[0, :]) * 0.9
             R[-1, :] = 0.1 + torch.sigmoid(R[-1, :]) * 0.9
-            R[1:-1, :] = 0.1 + torch.sigmoid(R[1:-1, :] ) * 3
+            R[1:-1, :] = 0.1 + torch.sigmoid(R[1:-1, :]) * 3
             # Gain mapping
             clip_min = torch.tensor(-1e-6, device=self.device)
             clip_max = torch.tensor(-5, device=self.device)
-            G =  clip_min + torch.sigmoid(param[:, 2, ...] - 1/2) * clip_max
+            G = clip_min + torch.sigmoid(param[:, 2, ...] - 1 / 2) * clip_max
         elif self.design == 'svf' and not is_twostage:
             # frequency mapping
-            bias = torch.log(2 * self.center_freq_bias / self.fs / (1 - 2 * self.center_freq_bias / self.fs)).to(device=self.device)
-            f = torch.tan(torch.pi * torch.sigmoid(param[:, 0, ...] + bias.unsqueeze(-1)) * 0.5) 
+            bias = torch.log(2 * self.center_freq_bias / self.fs /
+                             (1 - 2 * self.center_freq_bias / self.fs)).to(
+                                 device=self.device)
+            f = torch.tan(
+                torch.pi *
+                torch.sigmoid(param[:, 0, ...] + bias.unsqueeze(-1)) * 0.5)
             # Q factor mapping
-            R =  torch.log(1+torch.exp(param[:, 1, ...]))  / torch.log(torch.tensor(2, device=self.device)) 
-            # G 
-            G = 10**(-torch.log(1+torch.exp(param[:, 2, ...] - 1/2)) / torch.log(torch.tensor(2, device=self.device))) - 10
+            R = torch.log(1 + torch.exp(param[:, 1, ...])) / torch.log(
+                torch.tensor(2, device=self.device))
+            # G
+            G = 10**(-torch.log(1 + torch.exp(param[:, 2, ...] - 1 / 2)) /
+                     torch.log(torch.tensor(2, device=self.device))) - 10
         elif (self.design == 'svf' or self.design == 'biquad') and is_twostage:
             # frequency mapping
             bias = torch.tensor((torch.pi / 3), device=self.device)
-            f = torch.sigmoid(param[0]) / self.n_bands  + bias
-            # Q factor mapping 
+            f = torch.sigmoid(param[0]) / self.n_bands + bias
+            # Q factor mapping
             R = torch.zeros_like(param[1])
             R[:] = 0.1 + torch.sigmoid(R) * 0.9
             # Gain mapping
             clip_min = torch.tensor(-1e-6, device=self.device)
             clip_max = torch.tensor(-30, device=self.device)
-            G = clip_min + torch.sigmoid(param[2] - 1/2) * clip_max
+            G = clip_min + torch.sigmoid(param[2] - 1 / 2) * clip_max
 
         param = torch.cat(
             (
@@ -803,7 +834,7 @@ class parallelFDNPEQ(Filter):
             dim=0,
         )
         return param
-    
+
     def init_param(self):
         torch.nn.init.uniform_(self.param)
 
@@ -814,15 +845,13 @@ class parallelFDNPEQ(Filter):
 
     def get_freq_convolve(self):
         self.freq_convolve = lambda x, param: torch.einsum(
-            "fn,bfn...->bfn...", self.freq_response(param), x
-        )
+            "fn,bfn...->bfn...", self.freq_response(param), x)
 
     def initialize_class(self):
         self.check_param_shape()
         self.get_io()
         self.freq_response = to_complex(
-            torch.empty((self.nfft // 2 + 1, *self.size[2:]))
-        )
+            torch.empty((self.nfft // 2 + 1, *self.size[2:])))
         self.get_freq_response()
         self.get_freq_convolve()
 
@@ -830,8 +859,8 @@ class parallelFDNPEQ(Filter):
         r"""
         Compute the frequency response of the filter.
         """
-        self.freq_response = lambda param: self.get_poly_coeff(self.map(param))[0]
-
+        self.freq_response = lambda param: self.get_poly_coeff(self.map(param)
+                                                               )[0]
 
     def get_io(self):
         r"""
@@ -841,36 +870,312 @@ class parallelFDNPEQ(Filter):
         self.output_channels = len(self.delays)
 
 
-class parallelFirstOrderShelving(dsp.parallelFilter):
-    
+class parallelGFDNPEQ(parallelFDNPEQ):
+    r"""
+    Grouped counterpart of :class:`parallelFDNPEQ`.
+
+    One PEQ parameter set is learned per group of delay lines. Frequency
+    and resonance are shared by all delay lines within a group, while the
+    gain is scaled independently according to the delay length of each
+    delay line.
+
+    The delays are expected to be ordered as contiguous groups:
+        [group 0 delays, group 1 delays, ..., group N delays]
+
+    The raw parameter shape is:
+        (n_bands, 3, n_groups)
+    or, when ``is_twostage=True``:
+        (n_bands + 1, 3, n_groups)
+
+    The inherited ``get_poly_coeff()`` expands these parameters through
+    ``map_eq()`` and performs the actual biquad filter construction.
+    """
+
     def __init__(
         self,
+        n_bands: int = 10,
+        f_min: float = 20,
+        f_max: float = 20000,
+        delays: torch.Tensor = None,
+        design: str = "biquad",
+        is_twostage: bool = False,
+        is_proportional: bool = False,
         nfft: int = 2**11,
         fs: int = 48000,
-        rt_nyquist: float = 0.2,
-        delays: torch.Tensor =  None,
-        alias_decay_db: float = 0.0,
-        device: str = None,
+        n_groups: int = 1,
+        map: callable = lambda x: x,
         requires_grad: bool = False,
-        dtype: torch.dtype = torch.float32
+        alias_decay_db: float = 0.0,
+        device: Optional[str] = None,
+        dtype=torch.float32,
     ):
+        assert delays is not None, "Delays must be provided"
+
+        assert (len(delays) % n_groups == 0), (
+            f"len(delays) ({len(delays)}) must be divisible by "
+            f"n_groups ({n_groups})")
+
+        self.n_groups = n_groups
+        self.group_size = len(delays) // n_groups
+
+        super().__init__(
+            n_bands=n_bands,
+            f_min=f_min,
+            f_max=f_max,
+            delays=delays,
+            design=design,
+            is_twostage=is_twostage,
+            is_proportional=is_proportional,
+            nfft=nfft,
+            fs=fs,
+            map=map,
+            requires_grad=requires_grad,
+            alias_decay_db=alias_decay_db,
+            device=device,
+            dtype=dtype,
+        )
+
+        # One set of PEQ parameters per group rather than per delay line.
+        self.size = (
+            self.n_bands + 1 if self.is_twostage else self.n_bands,
+            3,
+            self.n_groups,
+        )
+
+        self.param = torch.nn.Parameter(
+            torch.empty(
+                self.size,
+                device=self.device,
+                dtype=dtype,
+            ),
+            requires_grad=requires_grad,
+        )
+        self.init_param()
+
+    def map_eq(self, param, is_twostage=False):
+        r"""
+        Map group-level raw PEQ parameters to delay-line-level parameters.
+
+        Input
+        -----
+        param : torch.Tensor
+            Shape ``(n_bands, 3, n_groups)``.
+
+        Output
+        ------
+        torch.Tensor
+            Shape ``(n_bands, 3, n_delays)``.
+
+        Frequency and resonance are shared by all delay lines within a
+        group. Gain is scaled by the individual delay length.
+        """
+
+        if self.design == 'biquad' and not is_twostage:
+            # Frequency mapping
+            bias = torch.tensor(
+                self.center_freq_bias / self.fs * 2 * torch.pi,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            min_f = torch.tensor(
+                2 * torch.pi * self.f_min / self.fs,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            max_f = torch.tensor(
+                2 * torch.pi * self.f_max / self.fs,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            f = torch.clamp(
+                torch.sigmoid(param[:, 0, :] - 1 / 2) / 2**(torch.linspace(
+                    self.n_bands,
+                    0,
+                    self.n_bands,
+                    device=self.device,
+                    dtype=param.dtype,
+                )).unsqueeze(-1) + bias.unsqueeze(-1),
+                min=min_f,
+                max=max_f,
+            )
+
+            # Q factor mapping
+            R = torch.zeros_like(param[:, 1, :])
+            R[0, :] = (0.1 + torch.sigmoid(param[0, 1, :]) * 0.9)
+            R[-1, :] = (0.1 + torch.sigmoid(param[-1, 1, :]) * 0.9)
+            R[1:-1, :] = (0.1 + torch.sigmoid(param[1:-1, 1, :]) * 3)
+
+            # Gain mapping (dB)
+            clip_min = torch.tensor(
+                -1e-6,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            clip_max = torch.tensor(
+                -5,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            G = (clip_min + torch.sigmoid(param[:, 2, :] - 1 / 2) * clip_max)
+
+        elif self.design == 'svf' and not is_twostage:
+            # Frequency mapping
+            bias = torch.log(2 * self.center_freq_bias / self.fs /
+                             (1 - 2 * self.center_freq_bias / self.fs)).to(
+                                 device=self.device,
+                                 dtype=param.dtype,
+                             )
+
+            f = torch.tan(torch.pi *
+                          torch.sigmoid(param[:, 0, :] + bias.unsqueeze(-1)) *
+                          0.5)
+            # Q factor mapping
+            R = (torch.log(1 + torch.exp(param[:, 1, :])) / torch.log(
+                torch.tensor(
+                    2,
+                    device=self.device,
+                    dtype=param.dtype,
+                )))
+            # Gain mapping (dB)
+            G = (10**(-torch.log(1 + torch.exp(param[:, 2, :] - 1 / 2)) /
+                      torch.log(
+                          torch.tensor(
+                              2,
+                              device=self.device,
+                              dtype=param.dtype,
+                          ))) - 10)
+
+        elif ((self.design == 'svf' or self.design == 'biquad')
+              and is_twostage):
+
+            # Frequency mapping for the additional shelving stage
+            bias = torch.tensor(
+                torch.pi / 3,
+                device=self.device,
+                dtype=param.dtype,
+            )
+
+            f = (torch.sigmoid(param[0, :]) / self.n_bands + bias)
+
+            # Q factor mapping
+            R = torch.zeros_like(param[1, :])
+            R[:] = (0.1 + torch.sigmoid(R) * 0.9)
+
+            # Gain mapping (dB)
+            clip_min = torch.tensor(
+                -1e-6,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            clip_max = torch.tensor(
+                -30,
+                device=self.device,
+                dtype=param.dtype,
+            )
+            G = (clip_min + torch.sigmoid(param[2, :] - 1 / 2) * clip_max)
+
+        else:
+            raise ValueError(f"Unsupported filter design: {self.design}")
+
+        # ---------------------------------------------------------
+        # Expand group parameters to individual delay lines
+        # ---------------------------------------------------------
+
+        if is_twostage:
+            # For the additional shelving stage, f, R and G are
+            # currently (n_groups,). Expand each group to its
+            # individual delay lines.
+            f = (f.unsqueeze(-1).expand(
+                self.n_groups,
+                self.group_size,
+            ).reshape(-1))
+
+            R = (R.unsqueeze(-1).expand(
+                self.n_groups,
+                self.group_size,
+            ).reshape(-1))
+
+            # G is already a dB gain; share it among the delay lines in the
+            # group.  Applying ``rt2slope`` here treats dB as RT60 seconds
+            # and reverses its sign, producing amplification.
+            G = (G.unsqueeze(-1).expand(
+                self.n_groups,
+                self.group_size,
+            ).reshape(-1))
+
+            return torch.stack(
+                (f, R, G),
+                dim=0,
+            )
+
+        else:
+            # f and R:
+            # (n_bands, n_groups)
+            #       ↓
+            # (n_bands, n_delays)
+            f = (f.unsqueeze(-1).expand(
+                self.n_bands,
+                self.n_groups,
+                self.group_size,
+            ).reshape(
+                self.n_bands,
+                len(self.delays),
+            ))
+
+            R = (R.unsqueeze(-1).expand(
+                self.n_bands,
+                self.n_groups,
+                self.group_size,
+            ).reshape(
+                self.n_bands,
+                len(self.delays),
+            ))
+
+            # Gain:
+            # (n_bands, n_groups)
+            #       ↓
+            # (n_bands, n_delays)
+
+            # G is already a dB gain; share the group's PEQ response across
+            # its delay lines without applying the RT60 conversion.
+            G = (G.unsqueeze(-1).expand(
+                self.n_bands,
+                self.n_groups,
+                self.group_size,
+            ).reshape(
+                self.n_bands,
+                len(self.delays),
+            ))
+
+            # output should be of size (num_bands, 3, n_delays)
+            return torch.stack((f, R, G), dim=0)
+
+
+class parallelFirstOrderShelving(dsp.parallelFilter):
+
+    def __init__(self,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 rt_nyquist: float = 0.2,
+                 delays: torch.Tensor = None,
+                 alias_decay_db: float = 0.0,
+                 device: str = None,
+                 requires_grad: bool = False,
+                 dtype: torch.dtype = torch.float32):
         assert (delays is not None), "Delays must be provided"
         self.delays = delays
         self.rt_nyquist = torch.tensor(rt_nyquist, device=device)
         map = lambda x: self.map_param(x, fs)
-        super().__init__(
-            size=self._param_size(),
-            nfft=nfft,
-            map=map,
-            alias_decay_db=alias_decay_db,
-            device=device,
-            requires_grad=requires_grad,
-            dtype=dtype
-        )
-        gamma = 10 ** (
-            -torch.abs(torch.tensor(alias_decay_db, device=device)) / (nfft) / 20
-        )
-        self.alias_envelope_dcy = gamma ** torch.arange(0, 2, 1, device=device)
+        super().__init__(size=self._param_size(),
+                         nfft=nfft,
+                         map=map,
+                         alias_decay_db=alias_decay_db,
+                         device=device,
+                         requires_grad=requires_grad,
+                         dtype=dtype)
+        gamma = 10**(-torch.abs(torch.tensor(alias_decay_db, device=device)) /
+                     (nfft) / 20)
+        self.alias_envelope_dcy = gamma**torch.arange(0, 2, 1, device=device)
         self.fs = fs
 
     def _param_size(self):
@@ -879,13 +1184,14 @@ class parallelFirstOrderShelving(dsp.parallelFilter):
         shelving crossover. Overridden by subclasses that learn more than
         one (rt_DC, crossover) pair, e.g. one per group of delay lines.
         """
-        return (2,)
+        return (2, )
 
     def get_freq_response(self):
         r"""
         Compute the frequency response of the filter.
         """
-        self.freq_response = lambda param: self.get_poly_coeff(self.map(param))[0]
+        self.freq_response = lambda param: self.get_poly_coeff(self.map(param)
+                                                               )[0]
 
     def get_poly_coeff(self, param):
         b, a = param  # each (batch, 2, n_delays)
@@ -917,19 +1223,30 @@ class parallelFirstOrderShelving(dsp.parallelFilter):
         omega_c = torch.clamp(param[:, 1], min=0, max=torch.pi)  # (batch,)
 
         gain_DC = rt2absorption(rt_DC, fs, self.delays)  # (batch, n_delays)
-        gain_Nyq = rt2slope(self.rt_nyquist, fs) * self.delays  # (n_delays,), same for every batch item
-        t = torch.tan(omega_c / 2).unsqueeze(-1)  # (batch, 1), broadcasts against n_delays
-        k = 10**(gain_DC/20) / 10**(gain_Nyq/20)  # (batch, n_delays)
+        gain_Nyq = rt2slope(
+            self.rt_nyquist,
+            fs) * self.delays  # (n_delays,), same for every batch item
+        t = torch.tan(omega_c / 2).unsqueeze(
+            -1)  # (batch, 1), broadcasts against n_delays
+        k = 10**(gain_DC / 20) / 10**(gain_Nyq / 20)  # (batch, n_delays)
 
         batch = param.shape[0]
-        a = torch.ones(batch, 2, len(self.delays), device=self.device, dtype=param.dtype)
-        b = torch.ones(batch, 2, len(self.delays), device=self.device, dtype=param.dtype)
+        a = torch.ones(batch,
+                       2,
+                       len(self.delays),
+                       device=self.device,
+                       dtype=param.dtype)
+        b = torch.ones(batch,
+                       2,
+                       len(self.delays),
+                       device=self.device,
+                       dtype=param.dtype)
 
         a[:, 0] = t / torch.sqrt(k) + 1
         a[:, 1] = t / torch.sqrt(k) - 1
         b[:, 0] = t * torch.sqrt(k) + 1
         b[:, 1] = t * torch.sqrt(k) - 1
-        return b * 10**(gain_Nyq/20), a
+        return b * 10**(gain_Nyq / 20), a
 
     def get_io(self):
         r"""
@@ -956,34 +1273,30 @@ class parallelGFDNFirstOrderShelving(parallelFirstOrderShelving):
             - other arguments as in :class:`parallelFirstOrderShelving`.
     """
 
-    def __init__(
-        self,
-        nfft: int = 2**11,
-        fs: int = 48000,
-        rt_nyquist: float = 0.2,
-        delays: torch.Tensor = None,
-        n_groups: int = 1,
-        alias_decay_db: float = 0.0,
-        device: str = None,
-        requires_grad: bool = False,
-        dtype: torch.dtype = torch.float32
-    ):
+    def __init__(self,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 rt_nyquist: float = 0.2,
+                 delays: torch.Tensor = None,
+                 n_groups: int = 1,
+                 alias_decay_db: float = 0.0,
+                 device: str = None,
+                 requires_grad: bool = False,
+                 dtype: torch.dtype = torch.float32):
         assert (delays is not None), "Delays must be provided"
         assert (
             len(delays) % n_groups == 0
         ), f"len(delays) ({len(delays)}) must be divisible by n_groups ({n_groups})"
         self.n_groups = n_groups
         self.group_size = len(delays) // n_groups
-        super().__init__(
-            nfft=nfft,
-            fs=fs,
-            rt_nyquist=rt_nyquist,
-            delays=delays,
-            alias_decay_db=alias_decay_db,
-            device=device,
-            requires_grad=requires_grad,
-            dtype=dtype
-        )
+        super().__init__(nfft=nfft,
+                         fs=fs,
+                         rt_nyquist=rt_nyquist,
+                         delays=delays,
+                         alias_decay_db=alias_decay_db,
+                         device=device,
+                         requires_grad=requires_grad,
+                         dtype=dtype)
 
     def _param_size(self):
         return (self.n_groups, 2)
@@ -1004,24 +1317,36 @@ class parallelGFDNFirstOrderShelving(parallelFirstOrderShelving):
         filter.
         """
         rt_DC = param[:, :, 0]  # (batch, n_groups)
-        omega_c = torch.clamp(param[:, :, 1], min=0, max=torch.pi)  # (batch, n_groups)
+        omega_c = torch.clamp(param[:, :, 1], min=0,
+                              max=torch.pi)  # (batch, n_groups)
 
         delays_grouped = self.delays.view(self.n_groups, self.group_size)
         gain_DC = torch.einsum(
-            "bg,gd->bgd", rt2slope(rt_DC, fs), delays_grouped
-        ).reshape(rt_DC.shape[0], -1)  # (batch, n_delays), group-major to match self.delays
-        gain_Nyq = rt2slope(self.rt_nyquist, fs) * self.delays  # (n_delays,), same for every batch item and group
-        t = torch.tan(omega_c / 2).unsqueeze(-1).expand(-1, -1, self.group_size).reshape(
-            omega_c.shape[0], -1
-        )  # (batch, n_delays)
-        k = 10**(gain_DC/20) / 10**(gain_Nyq/20)  # (batch, n_delays)
+            "bg,gd->bgd", rt2slope(rt_DC, fs), delays_grouped).reshape(
+                rt_DC.shape[0],
+                -1)  # (batch, n_delays), group-major to match self.delays
+        gain_Nyq = rt2slope(
+            self.rt_nyquist, fs
+        ) * self.delays  # (n_delays,), same for every batch item and group
+        t = torch.tan(omega_c / 2).unsqueeze(-1).expand(
+            -1, -1, self.group_size).reshape(omega_c.shape[0],
+                                             -1)  # (batch, n_delays)
+        k = 10**(gain_DC / 20) / 10**(gain_Nyq / 20)  # (batch, n_delays)
 
         batch = param.shape[0]
-        a = torch.ones(batch, 2, len(self.delays), device=self.device, dtype=param.dtype)
-        b = torch.ones(batch, 2, len(self.delays), device=self.device, dtype=param.dtype)
+        a = torch.ones(batch,
+                       2,
+                       len(self.delays),
+                       device=self.device,
+                       dtype=param.dtype)
+        b = torch.ones(batch,
+                       2,
+                       len(self.delays),
+                       device=self.device,
+                       dtype=param.dtype)
 
         a[:, 0] = t / torch.sqrt(k) + 1
         a[:, 1] = t / torch.sqrt(k) - 1
         b[:, 0] = t * torch.sqrt(k) + 1
         b[:, 1] = t * torch.sqrt(k) - 1
-        return b * 10**(gain_Nyq/20), a
+        return b * 10**(gain_Nyq / 20), a

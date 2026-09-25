@@ -8,6 +8,7 @@ import pyfar as pf
 import torch.nn.functional as F
 from typing import List
 
+
 # wrapper for the sparsity loss
 class sparsity_loss(nn.Module):
     r"""
@@ -33,7 +34,8 @@ class sparsity_loss(nn.Module):
         torch.Tensor: The calculated sparsity loss.
     """
 
-    def forward(self, y_pred: torch.Tensor, y_target: torch.Tensor, model: nn.Module):
+    def forward(self, y_pred: torch.Tensor, y_target: torch.Tensor,
+                model: nn.Module):
         core = model.get_core()
         # Try to get the mixing matrix from different possible locations
         mixing_matrix = None
@@ -53,7 +55,8 @@ class sparsity_loss(nn.Module):
             # loss assumes a single shared mixing matrix, so drop it before rebuilding
             # the Householder matrix (u.shape[0] would otherwise be batch, not N).
             u = A.squeeze(0)
-            A = torch.eye(u.shape[0], device=u.device, dtype=u.dtype) - 2 * u @ u.T
+            A = torch.eye(u.shape[0], device=u.device,
+                          dtype=u.dtype) - 2 * u @ u.T
 
         N = A.shape[-1]
         if mixing_matrix.matrix_type == "random_block_diagonal":
@@ -61,19 +64,20 @@ class sparsity_loss(nn.Module):
             block_size = N // n_blocks
             loss = 0
             for i in torch.arange(0, N, block_size):
-                block = A[..., i:i+block_size, i:i+block_size]
+                block = A[..., i:i + block_size, i:i + block_size]
                 N = block.shape[-1]
-                loss += (torch.sum(torch.abs(block)) - N * np.sqrt(N)) / (N * (1 - np.sqrt(N)))
-            return loss 
-        
+                loss += (torch.sum(torch.abs(block)) -
+                         N * np.sqrt(N)) / (N * (1 - np.sqrt(N)))
+            return loss
+
         if len(A.shape) == 3:
             return torch.mean(
-                (torch.sum(torch.abs(A), dim=(-2, -1)) - N * np.sqrt(N))
-                / (N * (1 - np.sqrt(N)))
-            )
-        
+                (torch.sum(torch.abs(A), dim=(-2, -1)) - N * np.sqrt(N)) /
+                (N * (1 - np.sqrt(N))))
+
         # A = torch.matrix_exp(skew_matrix(A))
-        return -(torch.sum(torch.abs(A)) - N * np.sqrt(N)) / (N * (np.sqrt(N) - 1))
+        return -(torch.sum(torch.abs(A)) - N * np.sqrt(N)) / (N *
+                                                              (np.sqrt(N) - 1))
 
 
 class mse_loss(nn.Module):
@@ -152,8 +156,7 @@ class masked_mse_loss(nn.Module):
         self.nfft = nfft
         self.regenerate_mask = regenerate_mask
         self.mask_indices = generate_partitions(
-            torch.arange(self.nfft // 2 + 1), n_samples, n_sets
-        )
+            torch.arange(self.nfft // 2 + 1), n_samples, n_sets)
         self.i = -1
 
     def forward(self, y_pred, y_true):
@@ -174,10 +177,11 @@ class masked_mse_loss(nn.Module):
             if self.regenerate_mask:
                 # generate a new mask
                 self.mask_indices = generate_partitions(
-                    torch.arange(self.nfft // 2 + 1), self.n_samples, self.n_sets
-                )
+                    torch.arange(self.nfft // 2 + 1), self.n_samples,
+                    self.n_sets)
         mask = self.mask_indices[self.i]
         return torch.mean(torch.pow(y_pred[:, mask] - y_true[:, mask], 2))
+
 
 class mel_mss_loss(nn.Module):
     r"""
@@ -219,10 +223,10 @@ class mel_mss_loss(nn.Module):
         name: str = "MelMSS",
         apply_mask: bool = False,
         threshold: float = 5,
-        p: str = "fro", 
+        p: str = "fro",
         log_term: bool = False,
         alpha: float = 1.0,
-        noise_energy = None,
+        noise_energy=None,
     ):
         super().__init__()
         self.nfft = nfft
@@ -233,7 +237,7 @@ class mel_mss_loss(nn.Module):
         self.device = device
         self.apply_mask = apply_mask
         self.threshold = threshold
-        self.p = p 
+        self.p = p
         self.log_term = log_term
         self.alpha = alpha
         self.noise_energy = noise_energy
@@ -275,8 +279,10 @@ class mel_mss_loss(nn.Module):
             mel_stft = mel_stft.to(self.device).to(y_pred.dtype)
 
             h, w = tuple(mel_stft(y_pred).shape[-2:])
-            Y_pred_lin = torch.reshape(mel_stft(y_pred), (batch_size, h, w, n_channels))
-            Y_true_lin = torch.reshape(mel_stft(y_true), (batch_size, h, w, n_channels))
+            Y_pred_lin = torch.reshape(mel_stft(y_pred),
+                                       (batch_size, h, w, n_channels))
+            Y_true_lin = torch.reshape(mel_stft(y_true),
+                                       (batch_size, h, w, n_channels))
 
             mask = torch.ones_like(Y_true_lin)
             if self.apply_mask:
@@ -284,16 +290,13 @@ class mel_mss_loss(nn.Module):
                     # compute the noise energy as the mean of the last 0.01s
                     self.noise_energy = torch.mean(
                         torch.pow(
-                            Y_true_lin[
-                                :, :, -int(0.01 * self.sample_rate / hop_length), :
-                            ],
+                            Y_true_lin[:, :, -int(0.01 * self.sample_rate /
+                                                  hop_length), :],
                             2,
-                        )
-                    )
+                        ))
                 SNR = 10 * torch.log10(
-                    torch.max(Y_true_lin**2, self.noise_energy * 1.01)
-                    - self.noise_energy
-                ) - 10 * torch.log10(self.noise_energy)
+                    torch.max(Y_true_lin**2, self.noise_energy * 1.01) -
+                    self.noise_energy) - 10 * torch.log10(self.noise_energy)
                 mask[SNR < self.threshold] = 0
                 N = torch.sum(mask)
             else:
@@ -302,12 +305,16 @@ class mel_mss_loss(nn.Module):
             # update match loss
             loss += torch.norm((Y_true_lin - Y_pred_lin) * mask, p=self.p) / N
             if self.log_term:
-                Y_pred_log = torch.reshape(torch.log(mel_stft(y_pred)), (batch_size, h, w, n_channels))
-                Y_true_log = torch.reshape(torch.log(mel_stft(y_true)), (batch_size, h, w, n_channels))
-                loss += self.alpha * torch.norm((Y_true_log - Y_pred_log) * mask, p=self.p) / N
-                
+                Y_pred_log = torch.reshape(torch.log(mel_stft(y_pred)),
+                                           (batch_size, h, w, n_channels))
+                Y_true_log = torch.reshape(torch.log(mel_stft(y_true)),
+                                           (batch_size, h, w, n_channels))
+                loss += self.alpha * torch.norm(
+                    (Y_true_log - Y_pred_log) * mask, p=self.p) / N
+
         return loss
-    
+
+
 class mss_loss(nn.Module):
     r"""
     Multi-Scale Spectral Loss in the linear scale.
@@ -416,14 +423,14 @@ class mss_loss(nn.Module):
             lin_stft = lin_stft.to(self.device).to(y_pred.dtype)
 
             h, w = tuple(lin_stft(y_pred).shape[-2:])
-            Y_pred_lin = torch.reshape(lin_stft(y_pred), (batch_size, h, w, n_channels))
-            Y_true_lin = torch.reshape(lin_stft(y_true), (batch_size, h, w, n_channels))
-            Y_pred_log = torch.reshape(
-                torch.log(lin_stft(y_pred)), (batch_size, h, w, n_channels)
-            )
-            Y_true_log = torch.reshape(
-                torch.log(lin_stft(y_true)), (batch_size, h, w, n_channels)
-            )
+            Y_pred_lin = torch.reshape(lin_stft(y_pred),
+                                       (batch_size, h, w, n_channels))
+            Y_true_lin = torch.reshape(lin_stft(y_true),
+                                       (batch_size, h, w, n_channels))
+            Y_pred_log = torch.reshape(torch.log(lin_stft(y_pred)),
+                                       (batch_size, h, w, n_channels))
+            Y_true_log = torch.reshape(torch.log(lin_stft(y_true)),
+                                       (batch_size, h, w, n_channels))
 
             mask = torch.ones_like(Y_true_lin)
             if self.apply_mask:
@@ -431,16 +438,13 @@ class mss_loss(nn.Module):
                     # compute the noise energy as the mean of the last 0.01s
                     self.noise_energy = torch.mean(
                         torch.pow(
-                            Y_true_lin[
-                                :, :, -int(0.01 * self.sample_rate / hop_length), :
-                            ],
+                            Y_true_lin[:, :, -int(0.01 * self.sample_rate /
+                                                  hop_length), :],
                             2,
-                        )
-                    )
+                        ))
                 SNR = 10 * torch.log10(
-                    torch.max(Y_true_lin**2, self.noise_energy * 1.01)
-                    - self.noise_energy
-                ) - 10 * torch.log10(self.noise_energy)
+                    torch.max(Y_true_lin**2, self.noise_energy * 1.01) -
+                    self.noise_energy) - 10 * torch.log10(self.noise_energy)
                 mask[SNR < self.threshold] = 0
                 N = torch.sum(mask)
             else:
@@ -448,26 +452,22 @@ class mss_loss(nn.Module):
 
             # update match loss
             if self.form is None:
-                loss += torch.norm((Y_true_lin - Y_pred_lin) * mask, p=self.p) / N
+                loss += torch.norm(
+                    (Y_true_lin - Y_pred_lin) * mask, p=self.p) / N
                 if self.log_term:
-                    loss += (
-                        self.alpha
-                        * torch.norm((Y_true_log - Y_pred_log) * mask, p=self.p)
-                        / N
-                    )
+                    loss += (self.alpha * torch.norm(
+                        (Y_true_log - Y_pred_log) * mask, p=self.p) / N)
             elif self.form == "yamamoto":
                 loss += torch.norm(
-                    (Y_true_lin - Y_pred_lin) * mask, p="fro"
-                ) / torch.norm(Y_true_lin, p="fro") + self.alpha * torch.norm(
-                    (Y_true_log - Y_pred_log) * mask, p=1
-                ) / torch.numel(
-                    Y_true_log
-                )
+                    (Y_true_lin - Y_pred_lin) * mask, p="fro") / torch.norm(
+                        Y_true_lin, p="fro") + self.alpha * torch.norm(
+                            (Y_true_log - Y_pred_log) * mask,
+                            p=1) / torch.numel(Y_true_log)
             elif self.form == "magenta":
-                loss += (
-                    torch.norm((Y_true_lin - Y_pred_lin) * mask, p=1)
-                    + self.alpha * torch.sum(torch.abs(Y_true_log - Y_pred_log) * mask)
-                ) / torch.numel(Y_true_lin)
+                loss += (torch.norm(
+                    (Y_true_lin - Y_pred_lin) * mask, p=1) + self.alpha *
+                         torch.sum(torch.abs(Y_true_log - Y_pred_log) * mask)
+                         ) / torch.numel(Y_true_lin)
 
         return loss
 
@@ -490,11 +490,11 @@ class AveragePower(nn.Module):
     """
 
     def __init__(
-        self,
-        energy_norm: bool = False,
-        name: str = "Average Power",
-        stride: tuple = (4, 4),
-        device="cpu",
+            self,
+            energy_norm: bool = False,
+            name: str = "Average Power",
+            stride: tuple = (4, 4),
+            device="cpu",
     ):
         super(AveragePower, self).__init__()
         self.name = name
@@ -525,8 +525,7 @@ class AveragePower(nn.Module):
                 hop_length=256,
                 window=torch.hann_window(1024).to(self.device),
                 return_complex=True,
-            )
-        )
+            ))
         S2 = torch.abs(
             torch.stft(
                 y_true.squeeze(),
@@ -534,11 +533,11 @@ class AveragePower(nn.Module):
                 hop_length=256,
                 window=torch.hann_window(1024).to(self.device),
                 return_complex=True,
-            )
-        )
+            ))
 
         # create 2d window
-        win = self.window2d(torch.hann_window(64, dtype=S1.dtype, device=self.device))
+        win = self.window2d(
+            torch.hann_window(64, dtype=S1.dtype, device=self.device))
         # convolve spectrograms with the window
         S1_win = F.conv2d(
             S1.unsqueeze(0).unsqueeze(0),
@@ -552,7 +551,8 @@ class AveragePower(nn.Module):
         ).squeeze()
         # compute the normalized difference between the two windowed spectrograms
         return (
-            torch.norm(S2_win - S1_win, p="fro") / torch.norm(S1_win, p="fro") / torch.norm(S2_win, p="fro"),
+            torch.norm(S2_win - S1_win, p="fro") /
+            torch.norm(S1_win, p="fro") / torch.norm(S2_win, p="fro"),
             S1_win,
             S2_win,
         )
@@ -645,7 +645,11 @@ class edr_loss(nn.Module):
             fmax=self.sample_rate // 2,
             n_mels=64,
             verbose=False,
-        ).to(self.device)
+        )
+        # nnAudio creates its convolution kernels in float32. Match both
+        # device and dtype to the signal: EDRLoss promotes its inputs to
+        # float64 below, and Conv1d requires the kernels and input to agree.
+        mel_stft = mel_stft.to(device=x.device, dtype=x.dtype)
 
         return mel_stft(x)
 
@@ -661,17 +665,19 @@ class edr_loss(nn.Module):
         n_channels = y_pred.shape[-1]
         batch_size = y_pred.shape[0]
         # reshape it to (num_audio, len_audio) as indicated by nnAudio
-        y_pred = torch.reshape(y_pred, (-1, y_pred.shape[1]))
-        y_true = torch.reshape(y_true, (-1, y_true.shape[1]))
+        y_pred = torch.reshape(y_pred, (-1, y_pred.shape[1])).double()
+        y_true = torch.reshape(y_true, (-1, y_true.shape[1])).double()
 
         h, w = tuple(self.mel_stft(y_pred).shape[-2:])
-        Y_pred = torch.reshape(self.mel_stft(y_pred), (batch_size, h, w, n_channels))
-        Y_true = torch.reshape(self.mel_stft(y_true), (batch_size, h, w, n_channels))
+        Y_pred = torch.reshape(self.mel_stft(y_pred),
+                               (batch_size, h, w, n_channels))
+        Y_true = torch.reshape(self.mel_stft(y_true),
+                               (batch_size, h, w, n_channels))
 
         Y_pred_edr = 10 * torch.log10(self.schroeder_backward_int(Y_pred)[0])
         Y_true_edr = 10 * torch.log10(self.schroeder_backward_int(Y_true)[0])
 
-        # in case you get bad targets 
+        # in case you get bad targets
         clip_indx = torch.nonzero(
             Y_true_edr == torch.tensor(-float("inf"), device=self.device),
             as_tuple=True,
@@ -679,7 +685,8 @@ class edr_loss(nn.Module):
         Y_true_edr[clip_indx] = torch.finfo(Y_true_edr.dtype).eps
         Y_pred_edr[clip_indx] = torch.finfo(Y_pred_edr.dtype).eps
 
-        loss = torch.norm(Y_true_edr - Y_pred_edr, p=1) / torch.norm(Y_true_edr, p=1)
+        loss = torch.norm(Y_true_edr - Y_pred_edr, p=1) / torch.norm(
+            Y_true_edr, p=1)
         return loss
 
 
@@ -734,18 +741,19 @@ class edc_loss(nn.Module):
                 pf.Signal(impulse.numpy(), self.sample_rate),
                 num_fractions=self.n_fractions,
                 frequency_range=(63, 16000),
-            ).freq.T
-        ).squeeze()
-        y = torch.zeros(*x.shape, filter.shape[1])
+            ).freq.T).squeeze().to(device=x.device, dtype=x.dtype)
+        y = torch.zeros(*x.shape,
+                        filter.shape[1],
+                        device=x.device,
+                        dtype=x.dtype)
 
         for i_band in range(filter.shape[-1]):
             y[..., i_band] = torch.fft.irfft(
                 torch.einsum(
                     "nfb,f->nfb",
                     torch.fft.rfft(x, dim=1, n=x.shape[1] * 2 - 1),
-                    torch.nn.functional.pad(
-                        filter[:, i_band], (0, x.shape[1] - filter.shape[0])
-                    ),
+                    torch.nn.functional.pad(filter[:, i_band],
+                                            (0, x.shape[1] - filter.shape[0])),
                 ),
                 dim=1,
                 n=x.shape[1],
@@ -785,7 +793,10 @@ class edc_loss(nn.Module):
         else:
             out = self.schroeder_backward_int(self.filterbank(out))[0]
         # get energy in dB
-        out = 10 * torch.log10(out)
+        # A finite-length RIR can have exactly zero remaining energy at its
+        # tail. Clamp before the logarithm so the subsequent MSE never sees
+        # -inf (which otherwise turns the loss into NaN).
+        out = 10 * torch.log10(out.clamp_min(torch.finfo(out.dtype).tiny))
 
         return out
 
@@ -805,7 +816,8 @@ class edc_loss(nn.Module):
         if self.clip:
             try:
                 clip_indx = torch.nonzero(
-                    y_true_edc < (torch.max(y_true_edc, dim=1, keepdim=True)[0] - 60),
+                    y_true_edc
+                    < (torch.max(y_true_edc, dim=1, keepdim=True)[0] - 60),
                     as_tuple=True,
                 )
                 y_pred_edc[clip_indx] = -180
