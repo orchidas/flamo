@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 from collections import OrderedDict
 
-from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving, parallelGFDNPEQ
+from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving, parallelGFDNPEQ, parallelGFDNGEQ
 from flamo.optimize.dataset import Dataset, load_dataset
 from flamo.optimize.loss import sparsity_loss, edr_loss, edc_loss
 from flamo.optimize.trainer import Trainer
@@ -79,6 +79,7 @@ class GroupedFDN(system.Shell):
         group_size: int,
         n_groups: int,
         delay_lengths: torch.Tensor | list[int],
+        filter_type: str = 'peq',
         rt_dc: Optional[float] = 1.0,
         rt_nyquist: Optional[float] = 0.2,
         crossover_freq: Optional[float] = 4000.0,
@@ -138,39 +139,52 @@ class GroupedFDN(system.Shell):
             dtype=dtype,
         )
 
-        # replace first order shelving with PEQs
+        if filter_type == 'shelf':
+            attenuation = parallelGFDNFirstOrderShelving(
+                nfft=nfft,
+                fs=fs,
+                rt_nyquist=rt_nyquist,
+                n_groups=n_groups,
+                delays=delay_lengths,
+                alias_decay_db=alias_decay_db,
+                requires_grad=True,
+                device=device,
+                dtype=dtype,
+            )
+            omega_c = 2 * torch.pi * crossover_freq / fs
+            attenuation.assign_value(
+                torch.tensor([rt_dc, omega_c], device=device, dtype=dtype))
 
-        # attenuation = parallelGFDNFirstOrderShelving(
-        #     nfft=nfft,
-        #     fs=fs,
-        #     rt_nyquist=rt_nyquist,
-        #     n_groups=n_groups,
-        #     delays=delay_lengths,
-        #     alias_decay_db=alias_decay_db,
-        #     requires_grad=True,
-        #     device=device,
-        #     dtype=dtype,
-        # )
-        # omega_c = 2 * torch.pi * crossover_freq / fs
-        # attenuation.assign_value(
-        #     torch.tensor([rt_dc, omega_c], device=device, dtype=dtype))
+        elif filter_type == 'peq':
+            attenuation = parallelGFDNPEQ(
+                n_bands=8,
+                f_min=20,
+                f_max=2000,
+                nfft=nfft,
+                fs=fs,
+                delays=delay_lengths,
+                design='biquad',
+                is_twostage=is_twostage,
+                is_proportional=False,
+                n_groups=n_groups,
+                alias_decay_db=alias_decay_db,
+                requires_grad=True,
+                device=device,
+                dtype=dtype,
+            )
 
-        attenuation = parallelGFDNPEQ(
-            n_bands=8,
-            f_min=20,
-            f_max=2000,
-            nfft=nfft,
-            fs=fs,
-            delays=delay_lengths,
-            design='biquad',
-            is_twostage=is_twostage,
-            is_proportional=False,
-            n_groups=n_groups,
-            alias_decay_db=alias_decay_db,
-            requires_grad=True,
-            device=device,
-            dtype=dtype,
-        )
+        elif filter_type == 'geq':
+            attenuation = parallelGFDNGEQ(octave_interval=1,
+                                          n_groups=n_groups,
+                                          nfft=nfft,
+                                          fs=fs,
+                                          delays=delay_lengths,
+                                          alias_decay_db=alias_decay_db,
+                                          requires_grad=True,
+                                          device=device,
+                                          dtype=dtype)
+        else:
+            raise ValueError('Filter type must be shelf / peq / geq')
 
         feedback = system.Series(
             OrderedDict({
@@ -238,6 +252,7 @@ def example_gfdn(args):
         crossover_freq=4000.0,
         alias_decay_db=alias_decay_db,
         is_twostage=args.is_twostage,
+        filter_type=args.filter_type,
         device=args.device,
         dtype=args.dtype,
     )
@@ -287,7 +302,10 @@ def example_gfdn(args):
     trainer.register_criterion(MultiResoSTFT(), 1)
     trainer.register_criterion(sparsity_loss(), 1, requires_model=True)
     # trainer.register_criterion(edr_loss(sample_rate=args.samplerate), 1)
-    # trainer.register_criterion(edc_loss(sample_rate=args.samplerate), 1e-6)
+    trainer.register_criterion(
+        edc_loss(sample_rate=args.samplerate,
+                 is_broadband=True,
+                 convergence=True), 1)
 
     ## ---------------- TRAIN ---------------- ##
 
@@ -342,9 +360,15 @@ if __name__ == "__main__":
                         default=False,
                         help="use masked loss")
     parser.add_argument("--is_twostage",
-                        type=bool,
                         action="store_true",
                         help="use two stage attenuation filter")
+    parser.add_argument(
+        "--filter_type",
+        type=str,
+        default='peq',
+        choices=['shelf', 'peq', 'geq'],
+        help='choice of attenuation filter',
+    )
     parser.add_argument(
         "--target_rir",
         type=str,

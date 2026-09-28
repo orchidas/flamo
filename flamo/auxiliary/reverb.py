@@ -405,7 +405,15 @@ class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
 
 
 class parallelGFDNAccurateGEQ(parallelFDNAccurateGEQ):
-    # TODO
+    r"""Grouped, fixed-parameter version of :class:`parallelFDNAccurateGEQ`.
+
+    Each group owns one RT60 value per GEQ command gain; those values are
+    converted to delay-dependent dB gains before the accurate GEQ design is
+    applied to each delay line.  ``accurate_geq`` contains an inner L-BFGS
+    solve, so this class is deliberately *not* differentiable.  Use
+    :class:`parallelGFDNGEQ` when the attenuation is to be learned.
+    """
+
     def __init__(self,
                  octave_interval: int = 1,
                  n_groups: int = 2,
@@ -418,8 +426,11 @@ class parallelGFDNAccurateGEQ(parallelFDNAccurateGEQ):
                  device=None,
                  dtype=torch.float32):
         assert (delays is not None), "Delays must be provided"
-        self.delays = delays
+        assert len(delays) % n_groups == 0, (
+            "len(delays) must be divisible by n_groups")
+        self.delays = torch.as_tensor(delays, device=device)
         self.n_groups = n_groups
+        self.group_size = len(delays) // n_groups
         super().__init__(octave_interval=octave_interval,
                          nfft=nfft,
                          delays=delays,
@@ -429,39 +440,42 @@ class parallelGFDNAccurateGEQ(parallelFDNAccurateGEQ):
                          end_freq=end_freq,
                          device=device,
                          dtype=dtype)
-        # self.size at this point is (batch, n_gains) (batch is always the singleton
-        # default here -- this class does not expose batch_size); n_gains is the
-        # last dim, not the first.
-        self.n_gains = self.size[-1]
-        self.size = (self.n_groups * self.n_gains, )
-        self.param = torch.nn.Parameter(torch.empty(self.size,
-                                                    device=self.device),
-                                        requires_grad=self.requires_grad)
-        self.map = map_gfdn_gamma(self.delays, self.n_groups, self.fs)
+        self.size = (self.n_gains, self.n_groups)
+        self.param = torch.nn.Parameter(
+            torch.empty(self.size, device=self.device, dtype=dtype),
+            requires_grad=False,
+        )
+        self.init_param()
+        self.map = self.map_group_rt60
+
+    def map_group_rt60(self, param: torch.Tensor) -> torch.Tensor:
+        """Expand group RT60s to delay-line dB gains for GEQ design."""
+        if param.shape != (self.n_gains, self.n_groups):
+            raise ValueError(
+                f"Expected (n_gains, n_groups) = "
+                f"({self.n_gains}, {self.n_groups}), got {tuple(param.shape)}")
+        delays = self.delays.reshape(self.n_groups, self.group_size)
+        gain_db = (rt2slope(param, self.fs).unsqueeze(-1) *
+                   delays.unsqueeze(0)).reshape(self.n_gains, -1)
+        return gain_db.unsqueeze(0)
 
     def get_poly_coeff(self, param):
         r"""
         Computes the polynomial coefficients for the SOS section.
         """
-        a = torch.zeros((3, self.size[0] + self.n_groups, len(self.delays)),
-                        device=self.device)
-        b = torch.zeros((3, self.size[0] + self.n_groups, len(self.delays)),
-                        device=self.device)
+        param = param.squeeze(0)
+        a = torch.zeros((3, self.n_gains + 1, len(self.delays)),
+                        device=self.device,
+                        dtype=param.dtype)
+        b = torch.zeros_like(a)
         for n_i in range(len(self.delays)):
-            for i_group in range(self.n_groups):
-                (
-                    b[:, i_group * (self.n_gains + 1):(i_group + 1) *
-                      (self.n_gains + 1), n_i],
-                    a[:, i_group * (self.n_gains + 1):(i_group + 1) *
-                      (self.n_gains + 1), n_i],
-                ) = accurate_geq(
-                    target_gain=param[i_group * self.n_gains:(i_group + 1) *
-                                      self.n_gains, n_i],
-                    center_freq=self.center_freq,
-                    shelving_crossover=self.shelving_crossover,
-                    fs=self.fs,
-                    device=self.device,
-                )
+            b[:, :, n_i], a[:, :, n_i] = accurate_geq(
+                target_gain=param[:, n_i],
+                center_freq=self.center_freq,
+                shelving_crossover=self.shelving_crossover,
+                fs=self.fs,
+                device=self.device,
+                dtype=param.dtype)
 
         b_aa = torch.einsum('p, pon -> pon',
                             self.alias_envelope_dcy.to(torch.double),
@@ -476,8 +490,6 @@ class parallelGFDNAccurateGEQ(parallelFDNAccurateGEQ):
             torch.abs(torch.prod(A, dim=1)) != 0, H_temp,
             torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
         H_type = torch.complex128 if param.dtype == torch.float64 else torch.complex64
-        # self.param has no batch dimension (rebuilt without one in __init__), so H
-        # needs one added back for the inherited (batch-first) freq_convolve.
         return H.to(H_type).unsqueeze(0), B, A
 
 
@@ -582,6 +594,84 @@ class parallelFDNGEQ(dsp.parallelGEQ):
 
     def init_param(self):
         return torch.nn.init.uniform_(self.param, a=1.0, b=3.0)
+
+
+class parallelGFDNGEQ(parallelFDNGEQ):
+    r"""Differentiable grouped GEQ attenuation for a grouped FDN.
+
+    ``param`` has shape ``(n_gains, n_groups)`` and stores positive RT60
+    values in seconds.  A group's command gains are converted to dB per delay
+    line as ``-60 * delay / (RT60 * fs)``.  Unlike
+    :class:`parallelGFDNAccurateGEQ`, this class uses :func:`geq` directly,
+    so gradients propagate to every group RT60 parameter.
+    """
+
+    def __init__(self,
+                 octave_interval: int = 1,
+                 n_groups: int = 2,
+                 nfft: int = 2**11,
+                 fs: int = 48000,
+                 delays: torch.Tensor = None,
+                 requires_grad: bool = False,
+                 alias_decay_db: float = 0.0,
+                 device: Optional[str] = None,
+                 dtype=torch.float32):
+        assert delays is not None, "Delays must be provided"
+        assert len(delays) % n_groups == 0, (
+            "len(delays) must be divisible by n_groups")
+        self.n_groups = n_groups
+        self.group_size = len(delays) // n_groups
+        super().__init__(octave_interval=octave_interval,
+                         nfft=nfft,
+                         fs=fs,
+                         delays=delays,
+                         requires_grad=requires_grad,
+                         alias_decay_db=alias_decay_db,
+                         device=device,
+                         dtype=dtype)
+        self.size = (self.n_gains, self.n_groups)
+        self.param = torch.nn.Parameter(
+            torch.empty(self.size, device=self.device, dtype=dtype),
+            requires_grad=requires_grad,
+        )
+        self.init_param()
+
+    def get_poly_coeff(self, param):
+        param = param.squeeze(0)
+        if param.shape != (self.n_gains, self.n_groups):
+            raise ValueError(
+                f"Expected (n_gains, n_groups) = "
+                f"({self.n_gains}, {self.n_groups}), got {tuple(param.shape)}")
+        a = torch.zeros((3, self.n_gains, len(self.delays)),
+                        device=self.device,
+                        dtype=param.dtype)
+        b = torch.zeros_like(a)
+        resonance = torch.tensor(2.7, device=self.device, dtype=param.dtype)
+        delays = self.delays.reshape(self.n_groups, self.group_size)
+        for group in range(self.n_groups):
+            gain_db = (rt2slope(param[:, group], self.fs).unsqueeze(-1) *
+                       delays[group])
+            b_group, a_group = geq(gain_db=gain_db,
+                                   center_freq=self.center_freq,
+                                   R=resonance,
+                                   shelving_freq=self.shelving_crossover,
+                                   fs=self.fs,
+                                   device=self.device,
+                                   dtype=param.dtype)
+            start = group * self.group_size
+            end = start + self.group_size
+            b[:, :, start:end] = b_group
+            a[:, :, start:end] = a_group
+        b_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy, b)
+        a_aa = torch.einsum('p, pon -> pon', self.alias_envelope_dcy, a)
+        B = torch.fft.rfft(b_aa, self.nfft, dim=0)
+        A = torch.fft.rfft(a_aa, self.nfft, dim=0)
+        denominator = torch.prod(A, dim=1)
+        H_temp = torch.prod(B, dim=1) / denominator
+        H = torch.where(
+            torch.abs(denominator) != 0, H_temp,
+            torch.finfo(H_temp.dtype).eps * torch.ones_like(H_temp))
+        return H.unsqueeze(0), B, A
 
 
 class parallelFDNPEQ(Filter):
