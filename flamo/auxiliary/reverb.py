@@ -303,6 +303,102 @@ class HomogeneousFDN:
         return 10**(gdB / 20)
 
 
+class parallelGFDNScalar(dsp.parallelGain):
+
+    def __init__(
+        self,
+        n_groups: int,
+        fs: float,
+        delays: torch.Tensor = None,
+        nfft: int = 2**11,
+        alias_decay_db: float = 0.0,
+        requires_grad: float = False,
+        device=None,
+        dtype=torch.float32,
+    ):
+        """Unique scalar attenuation in each delay line group of a GFDN"""
+        self.n_groups = n_groups
+        self.delays = torch.as_tensor(delays, device=device, dtype=dtype)
+        self.group_size = len(delays) // n_groups
+        self.fs = fs
+        # RT60 bounds
+        self.rt_min = 0.1  # 100 ms
+        self.rt_max = 5.0  # 5 s
+
+        assert len(delays) % n_groups == 0
+
+        # The parallelGain module needs size to correspond to the
+        # actual number of signal channels.
+        super().__init__(
+            size=(len(delays), ),
+            nfft=nfft,
+            map=self.map_param,
+            alias_decay_db=alias_decay_db,
+            device=device,
+            requires_grad=requires_grad,
+            dtype=dtype,
+        )
+
+        # Replace the n_delays learnable gains created by Gain
+        # with n_groups learnable RT60 parameters.
+        self.param = torch.nn.Parameter(
+            torch.ones(
+                1,
+                n_groups,
+                device=device,
+                dtype=dtype,
+            ))
+
+        self.param.requires_grad_(requires_grad)
+
+    def init_param(self):
+        # Initialise RT60s uniformly between 0.1 and 5.0 s.
+        rt60 = torch.empty_like(self.param).uniform_(
+            self.rt_min,
+            self.rt_max,
+        )
+
+        # Convert RT60 to the unconstrained sigmoid parameter:
+        # rt60 = rt_min + (rt_max - rt_min) * sigmoid(param)
+        self.param.data.copy_(
+            torch.log((rt60 - self.rt_min) / (self.rt_max - rt60)))
+
+    def get_io(self):
+        self.input_channels = len(self.delays)
+        self.output_channels = len(self.delays)
+
+    def get_rt60(self, param):
+        """
+        Map unconstrained parameters to RT60 values in
+        [0.1, 5.0] seconds.
+        """
+        return self.rt_min + (self.rt_max - self.rt_min) * torch.sigmoid(param)
+
+    def map_param(self, param: torch.Tensor):
+        # param: (batch, n_groups)
+        # RT60 for each group
+        rt60 = self.get_rt60(param)
+
+        # (n_groups, group_size)
+        delays_grouped = self.delays.reshape(self.n_groups, self.group_size)
+
+        # RT60 -> dB/sample slope
+        slope = rt2slope(rt60, self.fs)
+
+        # Expand each group's slope over its delay lines:
+        # (batch, n_groups, 1)
+        #       *
+        # (1, n_groups, group_size)
+        #       ↓
+        # (batch, n_groups, group_size)
+        # Each delay line therefore gets:
+        # G = slope_group * delay_length
+        gain = slope.unsqueeze(-1) * delays_grouped.unsqueeze(0)
+
+        # (batch, n_delays)
+        return gain.reshape(param.shape[0], len(self.delays))
+
+
 class parallelFDNAccurateGEQ(dsp.parallelAccurateGEQ):
     r"""
     Class for creating a set of parallel attenuation filters that are scaled 

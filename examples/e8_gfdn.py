@@ -2,15 +2,18 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import argparse
+import numpy as np
 import os
 import time
 import auraloss
+import pyrato
+import pyfar as pf
 import soundfile as sf
 import matplotlib.pyplot as plt
 
 from collections import OrderedDict
 
-from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving, parallelGFDNPEQ, parallelGFDNGEQ
+from flamo.auxiliary.reverb import parallelGFDNFirstOrderShelving, parallelGFDNPEQ, parallelGFDNGEQ, parallelGFDNScalar
 from flamo.optimize.dataset import Dataset, load_dataset
 from flamo.optimize.loss import sparsity_loss, edr_loss, edc_loss
 from flamo.optimize.trainer import Trainer
@@ -37,6 +40,80 @@ def plot_loss_history(trainer: Trainer, output_dir: str) -> None:
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "loss_history.png"), dpi=150)
     plt.close(fig)
+
+
+def extend_noise(noise: np.ndarray, n_samples: int) -> np.ndarray:
+    """
+    Extend a noise segment to ``n_samples`` via phase randomization: the
+    segment's magnitude spectrum is interpolated onto the frequency grid of
+    the target length and combined with uniformly random phases. The result
+    is rescaled to the segment's mean power.
+
+    Args:
+        noise: 1D noise segment.
+        n_samples: length of the extended noise.
+    Returns:
+        1D array of length ``n_samples``.
+    """
+    mag = np.abs(np.fft.rfft(noise))
+    freqs = np.fft.rfftfreq(len(noise))
+    new_freqs = np.fft.rfftfreq(n_samples)
+    new_mag = np.interp(new_freqs, freqs, mag)
+    phase = np.random.uniform(-np.pi, np.pi, len(new_freqs))
+    phase[0] = 0
+    if n_samples % 2 == 0:
+        phase[-1] = 0  # Nyquist bin must be real
+    out = np.fft.irfft(new_mag * np.exp(1j * phase), n=n_samples)
+    return out * np.sqrt(np.mean(noise**2) / np.mean(out**2))
+
+
+def extract_background_noise(rir: torch.Tensor,
+                             fs: int) -> tuple[torch.Tensor, int]:
+    """
+    Estimate the background noise of a RIR: the intersection time between
+    the decay and the noise floor is detected with pyrato's Lundeby method,
+    the RIR tail from that point on is taken as the noise segment, and the
+    segment is extended to the full RIR length via :func:`extend_noise`.
+
+    Args:
+        rir: 1D RIR tensor, onset-aligned (no leading silence).
+        fs: sample rate in Hz.
+    Returns:
+        ``(noise, start)`` where ``noise`` is a 1D tensor with the same length,
+        dtype and device as ``rir``, and ``start`` is the sample index where
+        the noise segment begins.
+    """
+    x = rir.detach().cpu().numpy().astype(np.float64).flatten()
+    intersection_time = pyrato.intersection_time_lundeby(pf.Signal(x, fs),
+                                                         freq="broadband")[0]
+    start = int(np.round(np.squeeze(intersection_time) * fs))
+    if start >= int(len(x) * 0.99):
+        start = int(len(x) *
+                    0.99)  # noise floor beyond the RIR: take the last 1%
+    noise = extend_noise(x[start:], len(x))
+    return torch.as_tensor(noise, dtype=rir.dtype, device=rir.device), start
+
+
+class NoisyLoss(nn.Module):
+    """
+    Wrap a criterion so that a fixed noise term is summed to the model output
+    before the loss is computed. This lets a noise-free model (e.g. a GFDN)
+    be fit to a target RIR with a background noise floor, without the loss
+    penalizing the missing noise in the tail of the EDC/EDR.
+
+    Args:
+        criterion: the loss to wrap, called as ``criterion(y_pred, y_true)``.
+        noise: noise term of shape ``(1, n_samples, n_channels)``, broadcast
+            over the batch.
+    """
+
+    def __init__(self, criterion: nn.Module, noise: torch.Tensor):
+        super().__init__()
+        self.criterion = criterion
+        self.register_buffer("noise", noise)
+
+    def forward(self, y_pred, y_true):
+        return self.criterion(y_pred + self.noise.to(y_pred.dtype), y_true)
 
 
 class MultiResoSTFT(nn.Module):
@@ -139,7 +216,17 @@ class GroupedFDN(system.Shell):
             dtype=dtype,
         )
 
-        if filter_type == 'shelf':
+        if filter_type == 'scalar':
+            attenuation = parallelGFDNScalar(n_groups=n_groups,
+                                             delays=delay_lengths,
+                                             fs=fs,
+                                             nfft=nfft,
+                                             alias_decay_db=alias_decay_db,
+                                             requires_grad=True,
+                                             device=device,
+                                             dtype=dtype)
+
+        elif filter_type == 'shelf':
             attenuation = parallelGFDNFirstOrderShelving(
                 nfft=nfft,
                 fs=fs,
@@ -231,6 +318,17 @@ def example_gfdn(args):
     target_rir = torch.nn.functional.pad(
         target_rir, (0, 0, 0, args.nfft - target_rir.shape[1]))
 
+    # background noise of the target, summed to the GFDN output in the loss
+    # (zero-padded like the target)
+    target_rir_1d = target_rir.flatten()
+    noise, noise_start = extract_background_noise(target_rir_1d,
+                                                  args.samplerate)
+    print(
+        f"Target RIR noise floor starts at {noise_start / args.samplerate:.3f} s"
+    )
+    noise = torch.nn.functional.pad(noise, (0, args.nfft - noise.shape[0]))
+    noise = noise.view(1, -1, 1).to(device=args.device, dtype=args.dtype)
+
     # GFDN parameters
     delays = [997, 1153, 1327, 1559]
     group_size = len(delays)
@@ -299,13 +397,14 @@ def example_gfdn(args):
         train_dir=args.train_dir,
         device=args.device,
     )
-    trainer.register_criterion(MultiResoSTFT(), 1)
+    trainer.register_criterion(NoisyLoss(MultiResoSTFT(), noise), 1)
     trainer.register_criterion(sparsity_loss(), 1, requires_model=True)
-    # trainer.register_criterion(edr_loss(sample_rate=args.samplerate), 1)
-    trainer.register_criterion(
-        edc_loss(sample_rate=args.samplerate,
-                 is_broadband=True,
-                 convergence=True), 1)
+    # trainer.register_criterion(NoisyLoss(edr_loss(sample_rate=args.samplerate), noise), 1)
+    # trainer.register_criterion(
+    #     NoisyLoss(
+    #         edc_loss(sample_rate=args.samplerate,
+    #                  is_broadband=True,
+    #                  convergence=True), noise), 1)
 
     ## ---------------- TRAIN ---------------- ##
 
@@ -320,6 +419,13 @@ def example_gfdn(args):
         save_audio(
             os.path.join(args.train_dir, "ir_optim.wav"),
             ir_optim / torch.max(torch.abs(ir_optim)),
+            fs=args.samplerate,
+        )
+
+        ir_optim_noisy = ir_optim + noise.squeeze()
+        save_audio(
+            os.path.join(args.train_dir, "ir_optim_noisy.wav"),
+            ir_optim_noisy / torch.max(torch.abs(ir_optim_noisy)),
             fs=args.samplerate,
         )
 
@@ -366,7 +472,7 @@ if __name__ == "__main__":
         "--filter_type",
         type=str,
         default='peq',
-        choices=['shelf', 'peq', 'geq'],
+        choices=['scalar', 'shelf', 'peq', 'geq'],
         help='choice of attenuation filter',
     )
     parser.add_argument(
