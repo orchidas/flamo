@@ -157,6 +157,7 @@ class GroupedFDN(system.Shell):
         n_groups: int,
         delay_lengths: torch.Tensor | list[int],
         filter_type: str = 'peq',
+        output_type: str = 'scalar',
         rt_dc: Optional[float] = 1.0,
         rt_nyquist: Optional[float] = 0.2,
         crossover_freq: Optional[float] = 4000.0,
@@ -184,14 +185,30 @@ class GroupedFDN(system.Shell):
             device=device,
             dtype=dtype,
         )
-        output_gain = dsp.Gain(
-            size=(out_ch, n_delays),
-            nfft=nfft,
-            requires_grad=True,
-            alias_decay_db=alias_decay_db,
-            device=device,
-            dtype=dtype,
-        )
+        if output_type == 'scalar':
+            output_gain = dsp.Gain(
+                size=(out_ch, n_delays),
+                nfft=nfft,
+                requires_grad=True,
+                alias_decay_db=alias_decay_db,
+                device=device,
+                dtype=dtype,
+            )
+        elif output_type == 'geq':
+            # A frequency-dependent C(z): every output component can apply
+            # its own GEQ to the contribution from every delay-line state.
+            output_gain = dsp.GEQ(
+                size=(out_ch, n_delays),
+                octave_interval=1,
+                nfft=nfft,
+                fs=fs,
+                requires_grad=True,
+                alias_decay_db=alias_decay_db,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            raise ValueError("output_type must be 'gain' or 'geq'")
 
         delays = dsp.parallelDelay(
             size=(n_delays, ),

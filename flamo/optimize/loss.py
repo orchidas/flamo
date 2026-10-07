@@ -1,12 +1,189 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import auraloss
 from flamo.optimize.utils import generate_partitions
 from flamo.processor.dsp import HouseholderMatrix
 from nnAudio import features
 import pyfar as pf
 import torch.nn.functional as F
 from typing import List
+
+
+def _finite_audio(x: torch.Tensor, max_amplitude: float = 1e6) -> torch.Tensor:
+    """Replace non-finite samples before an energy/logarithm calculation.
+
+    A temporarily unstable recursive filter can otherwise make the EDC
+    normalization evaluate ``inf / inf``.  The clamp is far above normal RIR
+    amplitudes and has no effect during regular optimisation.
+    """
+    return torch.nan_to_num(x,
+                            nan=0.0,
+                            posinf=max_amplitude,
+                            neginf=-max_amplitude).clamp(
+                                -max_amplitude, max_amplitude)
+
+
+class MultiChannelSTFTLoss(nn.Module):
+    """Multi-resolution STFT loss for signals shaped ``(batch, time, channel)``.
+
+    Unlike losses which flatten the channel axis before calculating an STFT,
+    this criterion keeps each channel independent and averages their spectral
+    convergence and log-magnitude errors.  It is consequently suitable for
+    ambisonic impulse responses, where channels must not be summed before the
+    analysis.
+    """
+
+    def __init__(self,
+                 fft_sizes: List[int] = (512, 1024, 2048),
+                 overlap: float = 0.75,
+                 log_epsilon: float = 1e-7):
+        super().__init__()
+        self.fft_sizes = tuple(fft_sizes)
+        self.overlap = overlap
+        self.log_epsilon = log_epsilon
+        # auraloss calculates spectral-convergence and log-magnitude terms at
+        # each FFT resolution. Its expected layout is (batch, channel, time),
+        # which preserves, rather than sums, ambisonic components.
+        self.mrstft = auraloss.freq.MultiResolutionSTFTLoss(
+            fft_sizes=list(self.fft_sizes),
+            hop_sizes=[
+                max(1, int(size * (1 - overlap))) for size in self.fft_sizes
+            ],
+            win_lengths=list(self.fft_sizes),
+        )
+
+    @staticmethod
+    def _check_inputs(y_pred: torch.Tensor, y_true: torch.Tensor):
+        if y_pred.ndim != 3 or y_pred.shape != y_true.shape:
+            raise ValueError(
+                "Expected equal tensors of shape (batch, time, channel).")
+
+    @staticmethod
+    def _stft(x: torch.Tensor, n_fft: int, hop_length: int) -> torch.Tensor:
+        # torch.stft accepts at most two dimensions. Flatten batch/channel
+        # into the batch axis, then restore the channel-preserving layout.
+        batch_size, n_samples, n_channels = x.shape
+        window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+        stft = torch.stft(x.permute(0, 2, 1).reshape(-1, n_samples),
+                          n_fft=n_fft,
+                          hop_length=hop_length,
+                          window=window,
+                          return_complex=True,
+                          center=True)
+        return stft.reshape(batch_size, n_channels, *stft.shape[-2:]).abs()
+
+    def forward(self, y_pred: torch.Tensor,
+                y_true: torch.Tensor) -> torch.Tensor:
+        self._check_inputs(y_pred, y_true)
+        return self.mrstft(
+            _finite_audio(y_pred).transpose(1, 2),
+            _finite_audio(y_true).transpose(1, 2))
+
+
+class MultiResolutionSCMLoss(nn.Module):
+    """Late-tail spatial covariance loss for multichannel impulse responses.
+
+    A complex spatial covariance matrix (SCM) is calculated independently for
+    each STFT frequency bin and late-time frame region. Trace normalization
+    makes the criterion sensitive to interchannel power and coherence, while
+    remaining independent of the overall decay energy; pair it with an EDC or
+    EDR loss to constrain that energy decay.
+
+    Inputs have shape ``(batch, time, channel)``. The channel ordering and
+    normalization are intentionally untouched, so matching AmbiX ACN/SN3D
+    target and prediction tensors can be used directly.
+    """
+
+    def __init__(self,
+                 fft_sizes: List[int] = (512, 1024, 2048),
+                 overlap: float = 0.75,
+                 sample_rate: int = 48000,
+                 late_start_s: float = 0.08,
+                 block_frames: int = 0,
+                 epsilon: float = 1e-8):
+        super().__init__()
+        if not 0 <= late_start_s:
+            raise ValueError("late_start_s must be non-negative")
+        if block_frames < 0:
+            raise ValueError(
+                "block_frames must be zero (whole tail) or positive")
+        self.fft_sizes = tuple(fft_sizes)
+        self.overlap = overlap
+        self.sample_rate = sample_rate
+        self.late_start_s = late_start_s
+        self.block_frames = block_frames
+        self.epsilon = epsilon
+
+    @staticmethod
+    def _check_inputs(y_pred: torch.Tensor, y_true: torch.Tensor):
+        if y_pred.ndim != 3 or y_pred.shape != y_true.shape:
+            raise ValueError(
+                "Expected equal tensors of shape (batch, time, channel).")
+
+    @staticmethod
+    def _complex_stft(x: torch.Tensor, n_fft: int,
+                      hop_length: int) -> torch.Tensor:
+        batch_size, n_samples, n_channels = x.shape
+        window = torch.hann_window(n_fft, device=x.device, dtype=x.dtype)
+        # Restore (batch, channel, frequency, frame) after flattening the
+        # batch/channel axes required by torch.stft.
+        stft = torch.stft(x.permute(0, 2, 1).reshape(-1, n_samples),
+                          n_fft=n_fft,
+                          hop_length=hop_length,
+                          window=window,
+                          return_complex=True,
+                          center=True)
+        return stft.reshape(batch_size, n_channels, *stft.shape[-2:])
+
+    def _scm(self, x: torch.Tensor, n_fft: int) -> torch.Tensor | None:
+        hop_length = max(1, int(n_fft * (1 - self.overlap)))
+        stft = self._complex_stft(_finite_audio(x), n_fft, hop_length)
+        start_frame = int(
+            np.ceil(self.late_start_s * self.sample_rate / hop_length))
+        stft = stft[..., start_frame:]
+        n_late_frames = stft.shape[-1]
+        if n_late_frames == 0:
+            return None
+        if self.block_frames == 0:
+            # Standard SCM estimate: average every frame in the selected late
+            # region into one covariance matrix per STFT frequency bin.
+            stft = stft.unsqueeze(-2)
+            frames_per_scm = n_late_frames
+        else:
+            n_blocks = n_late_frames // self.block_frames
+            if n_blocks == 0:
+                return None
+            stft = stft[..., :n_blocks * self.block_frames]
+            stft = stft.reshape(*stft.shape[:-1], n_blocks, self.block_frames)
+            frames_per_scm = self.block_frames
+        # stft dimes are (batch, channel, frequency, 1, num_frames) if block_frames = 0
+        # else (batch, channel, frequency, SCM block, frame-within-block)
+        # scm size is (batch, frequency, SCM block, channel, channel)
+        scm = torch.einsum("bcfkl,bdfkl->bfkcd", stft, stft.conj())
+        scm = scm / frames_per_scm
+        trace = scm.diagonal(dim1=-2, dim2=-1).real.sum(dim=-1)
+        # Trace normalization retains spatial power distribution and complex
+        # interchannel coherence but delegates total late energy to the EDC.
+        return scm / trace.clamp_min(self.epsilon)[..., None, None]
+
+    def forward(self, y_pred: torch.Tensor,
+                y_true: torch.Tensor) -> torch.Tensor:
+        self._check_inputs(y_pred, y_true)
+        loss = y_pred.new_zeros(())
+        n_used = 0
+        for n_fft in self.fft_sizes:
+            if n_fft > y_pred.shape[1]:
+                continue
+            pred_scm = self._scm(y_pred, n_fft)
+            true_scm = self._scm(y_true, n_fft)
+            if pred_scm is None or true_scm is None:
+                continue
+            loss = loss + (pred_scm - true_scm).abs().square().mean()
+            n_used += 1
+        if n_used == 0:
+            raise ValueError("The late region contains no complete SCM block.")
+        return loss / n_used
 
 
 # wrapper for the sparsity loss
@@ -609,13 +786,15 @@ class edr_loss(nn.Module):
     def schroeder_backward_int(self, x):
         # expected shape (batch_size, h, w, n_channels)
         # Backwards integral
-        out = torch.flip(x, dims=[-2])
+        out = torch.flip(_finite_audio(x), dims=[-2])
         out = torch.cumsum(out**2, dim=-2)
         out = torch.flip(out, dims=[-2])
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e12, neginf=0.0)
 
         # Normalize to 1
         if self.energy_norm:
-            norm_vals = torch.max(out, dim=-2, keepdim=True)[0]  # per channel
+            norm_vals = torch.amax(out, dim=-2, keepdim=True).clamp_min(
+                torch.finfo(out.dtype).eps)  # per frequency and channel
         else:
             norm_vals = torch.ones(out.shape, device=out.device)
 
@@ -662,32 +841,38 @@ class edr_loss(nn.Module):
             len(y_true.shape) == 3
         ), "y_pred and y_true must have the same shape (n_batch, n_samples, n_channels)"
 
-        n_channels = y_pred.shape[-1]
-        batch_size = y_pred.shape[0]
-        # reshape it to (num_audio, len_audio) as indicated by nnAudio
-        y_pred = torch.reshape(y_pred, (-1, y_pred.shape[1])).double()
-        y_true = torch.reshape(y_true, (-1, y_true.shape[1])).double()
+        batch_size, _, n_channels = y_pred.shape
+        # nnAudio accepts (audio, time). Move channels next to batch before
+        # flattening, otherwise a reshape interleaves time samples from
+        # different ambisonic components.
+        y_pred = _finite_audio(y_pred).permute(0, 2,
+                                               1).reshape(-1, y_pred.shape[1])
+        y_true = _finite_audio(y_true).permute(0, 2,
+                                               1).reshape(-1, y_true.shape[1])
+        pred_mel = self.mel_stft(y_pred)
+        true_mel = self.mel_stft(y_true)
+        n_bands, n_frames = pred_mel.shape[-2:]
+        Y_pred = pred_mel.reshape(batch_size, n_channels, n_bands,
+                                  n_frames).permute(0, 2, 3, 1)
+        Y_true = true_mel.reshape(batch_size, n_channels, n_bands,
+                                  n_frames).permute(0, 2, 3, 1)
 
-        h, w = tuple(self.mel_stft(y_pred).shape[-2:])
-        Y_pred = torch.reshape(self.mel_stft(y_pred),
-                               (batch_size, h, w, n_channels))
-        Y_true = torch.reshape(self.mel_stft(y_true),
-                               (batch_size, h, w, n_channels))
-
-        Y_pred_edr = 10 * torch.log10(self.schroeder_backward_int(Y_pred)[0])
-        Y_true_edr = 10 * torch.log10(self.schroeder_backward_int(Y_true)[0])
-
-        # in case you get bad targets
-        clip_indx = torch.nonzero(
-            Y_true_edr == torch.tensor(-float("inf"), device=self.device),
-            as_tuple=True,
-        )
-        Y_true_edr[clip_indx] = torch.finfo(Y_true_edr.dtype).eps
-        Y_pred_edr[clip_indx] = torch.finfo(Y_pred_edr.dtype).eps
-
-        loss = torch.norm(Y_true_edr - Y_pred_edr, p=1) / torch.norm(
-            Y_true_edr, p=1)
-        return loss
+        eps = torch.finfo(Y_pred.dtype).eps
+        floor_db = 10 * np.log10(eps)
+        Y_pred_edr = torch.nan_to_num(
+            10 *
+            torch.log10(self.schroeder_backward_int(Y_pred)[0].clamp_min(eps)),
+            nan=floor_db,
+            posinf=0.0,
+            neginf=floor_db)
+        Y_true_edr = torch.nan_to_num(
+            10 *
+            torch.log10(self.schroeder_backward_int(Y_true)[0].clamp_min(eps)),
+            nan=floor_db,
+            posinf=0.0,
+            neginf=floor_db)
+        return torch.norm((Y_true_edr - Y_pred_edr).clamp(-120.0, 120.0), p=1) / \
+            torch.norm(Y_true_edr, p=1).clamp_min(eps)
 
 
 ## -------------------- ENERGY DECAY CURVE LOSSES
@@ -770,13 +955,15 @@ class edc_loss(nn.Module):
     def schroeder_backward_int(self, x):
 
         # Backwards integral
-        out = torch.flip(x, dims=[1])
+        out = torch.flip(_finite_audio(x), dims=[1])
         out = torch.cumsum(out**2, dim=1)
         out = torch.flip(out, dims=[1])
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e12, neginf=0.0)
 
         # Normalize to 1
         if self.energy_norm:
-            norm_vals = torch.max(out, dim=1, keepdim=True)[0]  # per channel
+            norm_vals = torch.amax(out, dim=1, keepdim=True).clamp_min(
+                torch.finfo(out.dtype).eps)  # per channel (and band)
         else:
             norm_vals = torch.ones_like(out)
 
@@ -796,7 +983,12 @@ class edc_loss(nn.Module):
         # A finite-length RIR can have exactly zero remaining energy at its
         # tail. Clamp before the logarithm so the subsequent MSE never sees
         # -inf (which otherwise turns the loss into NaN).
-        out = 10 * torch.log10(out.clamp_min(torch.finfo(out.dtype).tiny))
+        eps = torch.finfo(out.dtype).eps
+        floor_db = 10 * np.log10(eps)
+        out = torch.nan_to_num(10 * torch.log10(out.clamp_min(eps)),
+                               nan=floor_db,
+                               posinf=0.0,
+                               neginf=floor_db)
 
         return out
 
@@ -826,8 +1018,12 @@ class edc_loss(nn.Module):
                 pass
 
         # compute normalized mean squared error on the EDCs
-        num = self.mse(y_pred_edc, y_true_edc)
-        den = torch.mean(torch.pow(y_true_edc, 2))
+        # Bound very large EDC deviations so a transiently unstable recursive
+        # model cannot create an infinite logarithmic-loss gradient.
+        num = self.mse((y_pred_edc - y_true_edc).clamp(-120.0, 120.0),
+                       torch.zeros_like(y_true_edc))
+        den = torch.mean(torch.pow(y_true_edc, 2)).clamp_min(
+            torch.finfo(y_true_edc.dtype).eps)
         if self.convergence:
             return num / den
         else:

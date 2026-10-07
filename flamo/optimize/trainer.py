@@ -59,6 +59,7 @@ class Trainer:
         log: bool = True,
         train_dir: str = None,
         device: str = "cpu",
+        max_grad_norm: float | None = None,
     ):
         self.device = device
         self.log = log
@@ -67,6 +68,7 @@ class Trainer:
         self.lr = lr
         self.patience = patience
         self.patience_delta = patience_delta
+        self.max_grad_norm = max_grad_norm
         self.min_val_loss = float("inf")
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         self.n_loss = 0
@@ -196,6 +198,10 @@ class Trainer:
                 self.train_loss_log[criterion.__class__.__name__].append(temp.item())
                 loss += alpha * temp
         loss.backward()
+        if self.max_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(),
+                                           self.max_grad_norm,
+                                           error_if_nonfinite=True)
         self.optimizer.step()
         return loss.item()
 

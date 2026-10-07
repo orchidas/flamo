@@ -323,7 +323,7 @@ class parallelGFDNScalar(dsp.parallelGain):
         self.fs = fs
         # RT60 bounds
         self.rt_min = 0.1  # 100 ms
-        self.rt_max = 5.0  # 5 s
+        self.rt_max = 10.0  # 10 s
 
         assert len(delays) % n_groups == 0
 
@@ -744,8 +744,13 @@ class parallelGFDNGEQ(parallelFDNGEQ):
         b = torch.zeros_like(a)
         resonance = torch.tensor(2.7, device=self.device, dtype=param.dtype)
         delays = self.delays.reshape(self.n_groups, self.group_size)
+        # The optimized parameters represent RT60 values. An unconstrained
+        # optimizer can cross zero, after which rt2slope divides by a negative
+        # or near-zero value and turns the attenuation filter into an unstable
+        # feedback gain. Keep the filter design in a physically valid range.
+        rt60 = param.clamp(min=0.05, max=15.0)
         for group in range(self.n_groups):
-            gain_db = (rt2slope(param[:, group], self.fs).unsqueeze(-1) *
+            gain_db = (rt2slope(rt60[:, group], self.fs).unsqueeze(-1) *
                        delays[group])
             b_group, a_group = geq(gain_db=gain_db,
                                    center_freq=self.center_freq,

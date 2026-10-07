@@ -26,6 +26,7 @@ classifiers = [
 dependencies = [
     "torch",
     "torchaudio",
+    "auraloss",
     "numpy",
     "scipy",
     "PySoundFile",
